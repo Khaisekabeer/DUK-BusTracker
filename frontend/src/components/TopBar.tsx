@@ -41,5 +41,5 @@ export default function TopBar({ showBack, onBack }: TopBarProps) {
 const S = StyleSheet.create({
   topBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 12, backgroundColor: Colors.white, borderBottomWidth: 1, borderBottomColor: Colors.separator },
   iconBtn: { padding: 4, width: 36, alignItems: 'center' },
-  logo:    { width: 44, height: 44 },
+  logo:    { width: 44, height: 70 },
 });

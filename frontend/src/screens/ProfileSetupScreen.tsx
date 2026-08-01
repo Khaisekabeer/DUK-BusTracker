@@ -18,11 +18,11 @@ import {
   StyleSheet,
   LayoutAnimation,
   Keyboard,
+  Image
 } from 'react-native';
 import Ionicons from '@react-native-vector-icons/ionicons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Colors from '../theme/colors';
-import TopBar from '../components/TopBar';
 
 const EMAIL_DOMAINS = ['@duk.ac.in', '@iitmk.ac.in'];
 
@@ -50,16 +50,16 @@ export default function ProfileSetupScreen({ navigation }: any) {
   const [dropdownOpen, setDropdown]         = useState(false);
 
   // Animations
-  const cardScale   = useRef(new Animated.Value(0.92)).current;
+  const cardScale   = useRef(new Animated.Value(0.95)).current;
   const cardOpacity = useRef(new Animated.Value(0)).current;
-  const cardY       = useRef(new Animated.Value(12)).current;
+  const cardY       = useRef(new Animated.Value(10)).current;
   const arrowRot    = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
     Animated.parallel([
-      Animated.timing(cardOpacity, { toValue: 1, duration: 500, useNativeDriver: true }),
-      Animated.timing(cardScale,   { toValue: 1, duration: 500, useNativeDriver: true }),
-      Animated.timing(cardY,       { toValue: 0, duration: 500, useNativeDriver: true }),
+      Animated.timing(cardOpacity, { toValue: 1, duration: 400, useNativeDriver: true }),
+      Animated.timing(cardScale,   { toValue: 1, duration: 400, useNativeDriver: true }),
+      Animated.timing(cardY,       { toValue: 0, duration: 400, useNativeDriver: true }),
     ]).start();
   }, [cardOpacity, cardScale, cardY]);
 
@@ -110,25 +110,32 @@ export default function ProfileSetupScreen({ navigation }: any) {
   const arrowSpin = arrowRot.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '180deg'] });
 
   return (
-    <SafeAreaView style={S.safeArea} edges={['top']}>
+    <SafeAreaView style={S.safeArea} edges={['top', 'bottom']}>
       <StatusBar barStyle="dark-content" backgroundColor={Colors.white} />
 
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={S.root}>
-
-        <TopBar />
-
         <ScrollView
           contentContainerStyle={S.scrollContent}
           showsVerticalScrollIndicator={false}
           keyboardShouldPersistTaps="handled"
+          bounces={false}
         >
+          {/* Logo Header Container */}
+          <View style={S.logoContainer}>
+            <Image
+              source={require('../../duklogo.png')}
+              style={S.logo}
+              resizeMode="contain"
+            />
+          </View>
+
           <Animated.View style={[S.card, { opacity: cardOpacity, transform: [{ scale: cardScale }, { translateY: cardY }] }]}>
 
             <Text style={S.cardHeading}>Set up your profile</Text>
             <Text style={S.cardSub}>Use your university email to verify access</Text>
 
             {/* Name field */}
-            <View style={S.formGroup}>
+            <View style={[S.formGroup, { zIndex: 1 }]}>
               <Text style={S.formLabel}>Full Name</Text>
               <TextInput
                 style={[S.formInput, nameOk && S.formInputFilled]}
@@ -143,7 +150,7 @@ export default function ProfileSetupScreen({ navigation }: any) {
             </View>
 
             {/* Email field — prefix input + domain dropdown */}
-            <View style={[S.formGroup, { zIndex: 20 }]}>
+            <View style={[S.formGroup, { zIndex: domainDropOpen ? 50 : 2 }]}>
               <Text style={S.formLabel}>University Email</Text>
               <View style={[
                 S.emailRow,
@@ -180,7 +187,7 @@ export default function ProfileSetupScreen({ navigation }: any) {
               )}
               {prefixOk && (
                 <View style={S.domainBadge}>
-                  <Ionicons name="shield-checkmark" size={11} color={Colors.mintDark} />
+                  <Ionicons name="shield-checkmark" size={12} color={Colors.mintDark} />
                   <Text style={S.domainBadgeText}>Verified domain</Text>
                 </View>
               )}
@@ -196,7 +203,7 @@ export default function ProfileSetupScreen({ navigation }: any) {
                       activeOpacity={0.7}
                     >
                       <Text style={[S.domainOptionText, selectedDomain === d && S.domainOptionTextActive]}>{d}</Text>
-                      {selectedDomain === d && <Ionicons name="checkmark" size={14} color={Colors.mintDark} />}
+                      {selectedDomain === d && <Ionicons name="checkmark" size={16} color={Colors.mintDark} />}
                     </TouchableOpacity>
                   ))}
                 </View>
@@ -204,14 +211,14 @@ export default function ProfileSetupScreen({ navigation }: any) {
             </View>
 
             {/* Boarding stop dropdown */}
-            <View style={[S.formGroup, { zIndex: 10 }]}>
+            <View style={[S.formGroup, { zIndex: dropdownOpen ? 100 : 3 }]}>
               <Text style={S.formLabel}>Boarding Stop</Text>
               <TouchableOpacity
                 style={[S.formInput, S.dropdownTrigger, selectedPoint && S.formInputFilled]}
                 onPress={toggleDropdown}
                 activeOpacity={0.7}
               >
-                <Text style={[S.dropdownText, selectedPoint ? S.dropdownTextSelected : S.dropdownTextPlaceholder]}>
+                <Text style={[S.dropdownText, selectedPoint ? S.dropdownTextSelected : S.dropdownTextPlaceholder]} numberOfLines={1}>
                   {selectedPoint ? selectedPoint.name : 'Select your boarding stop'}
                 </Text>
                 <Animated.View style={{ transform: [{ rotate: arrowSpin }] }}>
@@ -221,22 +228,29 @@ export default function ProfileSetupScreen({ navigation }: any) {
 
               {dropdownOpen && (
                 <View style={S.dropdownList}>
-                  <ScrollView nestedScrollEnabled showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled" style={{ padding: 6 }}>
+                  <ScrollView
+                    nestedScrollEnabled={true}
+                    showsVerticalScrollIndicator={true}
+                    persistentScrollbar={true}
+                    keyboardShouldPersistTaps="handled"
+                    style={S.dropdownScrollView}
+                    contentContainerStyle={S.dropdownScrollContent}
+                  >
                     {DEFAULT_BUS_POINTS.map(p => (
                       <TouchableOpacity
                         key={p.id}
                         style={[S.dropdownItem, selectedPoint?.id === p.id && S.dropdownItemSelected]}
                         onPress={() => selectPoint(p)}
-                        activeOpacity={0.6}
+                        activeOpacity={0.65}
                       >
                         <View style={[S.ddIcon, selectedPoint?.id === p.id && S.ddIconSelected]}>
-                          <Ionicons name="bus-outline" size={16} color={selectedPoint?.id === p.id ? Colors.white : Colors.mintDark} />
+                          <Ionicons name="bus-outline" size={16} color={selectedPoint?.id === p.id ? Colors.black : Colors.mintDark} />
                         </View>
-                        <View style={{ flex: 1 }}>
-                          <Text style={S.ddName}>{p.name}</Text>
-                          <Text style={S.ddDesc}>{p.desc}</Text>
+                        <View style={{ flex: 1, paddingRight: 8 }}>
+                          <Text style={S.ddName} numberOfLines={1}>{p.name}</Text>
+                          <Text style={S.ddDesc} numberOfLines={1}>{p.desc}</Text>
                         </View>
-                        {selectedPoint?.id === p.id && <Ionicons name="checkmark" size={16} color={Colors.mintDark} />}
+                        {selectedPoint?.id === p.id && <Ionicons name="checkmark-circle" size={18} color={Colors.mintDark} />}
                       </TouchableOpacity>
                     ))}
                   </ScrollView>
@@ -256,13 +270,6 @@ export default function ProfileSetupScreen({ navigation }: any) {
             </TouchableOpacity>
 
           </Animated.View>
-
-          {/* Page indicator — dot 1 of 3 */}
-          <View style={S.pageDots}>
-            <View style={[S.dot, S.dotActive]} />
-            <View style={[S.dot, S.dotInactive]} />
-            <View style={[S.dot, S.dotInactive]} />
-          </View>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -272,24 +279,30 @@ export default function ProfileSetupScreen({ navigation }: any) {
 const S = StyleSheet.create({
   safeArea:              { flex: 1, backgroundColor: Colors.white },
   root:                  { flex: 1, backgroundColor: Colors.white },
-  scrollContent:         { flexGrow: 1, justifyContent: 'center', paddingHorizontal: 20, paddingVertical: 24 },
-  card:                  { width: '100%', backgroundColor: Colors.white, borderRadius: 24, paddingHorizontal: 24, paddingTop: 32, paddingBottom: 28, shadowColor: '#000', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.12, shadowRadius: 40, elevation: 16, borderWidth: 1, borderColor: 'rgba(0,0,0,0.04)' },
-  cardHeading:           { fontSize: 22, fontWeight: '800', color: Colors.black, marginBottom: 4 },
-  cardSub:               { fontSize: 13, color: Colors.medGray, marginBottom: 24 },
-  formGroup:             { marginBottom: 20, position: 'relative' },
+  scrollContent:         { flexGrow: 1, justifyContent: 'center', paddingHorizontal: 20, paddingVertical: 20 },
+  
+  // Logo styling
+  logoContainer:         { alignItems: 'center', justifyContent: 'center', paddingTop: 10, paddingBottom: 24 },
+  logo:                  { width: 170, height: 80 },
+
+  card:                  { width: '100%', backgroundColor: Colors.white, borderRadius: 24, paddingHorizontal: 20, paddingTop: 28, paddingBottom: 28, shadowColor: '#000', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.1, shadowRadius: 30, elevation: 12, borderWidth: 1, borderColor: 'rgba(0,0,0,0.06)' },
+  cardHeading:           { fontSize: 22, fontWeight: '800', color: Colors.black, marginBottom: 4, textAlign: 'center' },
+  cardSub:               { fontSize: 13, color: Colors.medGray, marginBottom: 24, textAlign: 'center' },
+  
+  formGroup:             { marginBottom: 18, position: 'relative' },
   formLabel:             { fontSize: 13, fontWeight: '600', color: Colors.black, marginBottom: 8 },
-  formInput:             { height: 50, paddingHorizontal: 16, fontSize: 15, color: Colors.black, backgroundColor: Colors.white, borderWidth: 1.5, borderColor: Colors.border, borderRadius: 14 },
+  formInput:             { height: 52, paddingHorizontal: 16, fontSize: 15, color: Colors.black, backgroundColor: Colors.white, borderWidth: 1.5, borderColor: Colors.border, borderRadius: 14 },
   formInputFilled:       { borderColor: Colors.mint },
 
   // Email row
-  emailRow:              { height: 50, flexDirection: 'row', alignItems: 'center', borderWidth: 1.5, borderColor: Colors.border, borderRadius: 14, backgroundColor: Colors.white, overflow: 'hidden' },
+  emailRow:              { height: 52, flexDirection: 'row', alignItems: 'center', borderWidth: 1.5, borderColor: Colors.border, borderRadius: 14, backgroundColor: Colors.white, overflow: 'hidden' },
   emailRowFilled:        { borderColor: Colors.mint },
   emailRowError:         { borderColor: Colors.danger },
   emailPrefixInput:      { flex: 1, height: '100%', paddingHorizontal: 16, fontSize: 15, color: Colors.black },
-  domainSelector:        { height: '100%', flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, gap: 4, borderLeftWidth: 1, borderLeftColor: Colors.border },
+  domainSelector:        { height: '100%', flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, gap: 6, borderLeftWidth: 1, borderLeftColor: Colors.border, backgroundColor: 'rgba(162, 215, 195, 0.08)' },
   domainSelectorText:    { fontSize: 13, fontWeight: '600', color: Colors.mintText },
-  domainDropdown:        { position: 'absolute', top: 82, right: 0, backgroundColor: Colors.white, borderWidth: 1.5, borderColor: Colors.border, borderRadius: 12, shadowColor: '#000', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.12, shadowRadius: 20, elevation: 16, zIndex: 30, minWidth: 160 },
-  domainOption:          { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 12, paddingHorizontal: 16 },
+  domainDropdown:        { position: 'absolute', top: 82, right: 0, backgroundColor: Colors.white, borderWidth: 1.5, borderColor: Colors.border, borderRadius: 14, shadowColor: '#000', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.12, shadowRadius: 20, elevation: 20, zIndex: 100, minWidth: 160, overflow: 'hidden' },
+  domainOption:          { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 14, paddingHorizontal: 16 },
   domainOptionActive:    { backgroundColor: Colors.mintLighter },
   domainOptionText:      { fontSize: 14, color: Colors.darkGray },
   domainOptionTextActive:{ fontWeight: '700', color: Colors.mintText },
@@ -302,19 +315,19 @@ const S = StyleSheet.create({
   dropdownTrigger:       { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingRight: 14 },
   dropdownText:          { fontSize: 15, flex: 1 },
   dropdownTextPlaceholder: { color: Colors.medGray },
-  dropdownTextSelected:  { color: Colors.black, fontWeight: '500' },
-  dropdownList:          { position: 'absolute', top: 78, left: 0, right: 0, backgroundColor: Colors.white, borderWidth: 1.5, borderColor: Colors.border, borderRadius: 14, shadowColor: '#000', shadowOffset: { width: 0, height: 12 }, shadowOpacity: 0.12, shadowRadius: 40, elevation: 20, zIndex: 50, maxHeight: 260 },
-  dropdownItem:          { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12, paddingHorizontal: 12, borderRadius: 10 },
-  dropdownItemSelected:  { backgroundColor: 'rgba(162, 215, 195, 0.15)' },
-  ddIcon:                { width: 36, height: 36, borderRadius: 10, backgroundColor: Colors.mintLighter, justifyContent: 'center', alignItems: 'center' },
+  dropdownTextSelected:  { color: Colors.black, fontWeight: '600' },
+  
+  dropdownList:          { position: 'absolute', top: 82, left: 0, right: 0, backgroundColor: Colors.white, borderWidth: 1.5, borderColor: Colors.border, borderRadius: 16, shadowColor: '#000', shadowOffset: { width: 0, height: 12 }, shadowOpacity: 0.15, shadowRadius: 30, elevation: 24, zIndex: 100, overflow: 'hidden' },
+  dropdownScrollView:    { maxHeight: 240 },
+  dropdownScrollContent: { paddingVertical: 6, paddingHorizontal: 6 },
+  dropdownItem:          { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, paddingHorizontal: 12, borderRadius: 12, marginVertical: 2 },
+  dropdownItemSelected:  { backgroundColor: 'rgba(162, 215, 195, 0.2)' },
+  ddIcon:                { width: 34, height: 34, borderRadius: 10, backgroundColor: 'rgba(162, 215, 195, 0.25)', justifyContent: 'center', alignItems: 'center' },
   ddIconSelected:        { backgroundColor: Colors.mint },
-  ddName:                { fontSize: 14, fontWeight: '500', color: Colors.black },
+  ddName:                { fontSize: 14, fontWeight: '600', color: Colors.black },
   ddDesc:                { fontSize: 11, color: Colors.darkGray, marginTop: 1 },
-  continueBtn:           { height: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: Colors.mint, borderRadius: 14, marginTop: 4 },
+  
+  continueBtn:           { height: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: Colors.mint, borderRadius: 16, marginTop: 8 },
   continueBtnDisabled:   { opacity: 0.45 },
   continueBtnText:       { fontSize: 16, fontWeight: '700', color: Colors.black },
-  pageDots:              { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, paddingTop: 32, paddingBottom: 16 },
-  dot:                   { width: 10, height: 10, borderRadius: 5 },
-  dotInactive:           { backgroundColor: Colors.white, borderWidth: 2, borderColor: Colors.border },
-  dotActive:             { backgroundColor: Colors.mint, width: 24, borderRadius: 5 },
 });
