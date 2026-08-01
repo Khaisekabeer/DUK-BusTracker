@@ -8,31 +8,31 @@ from functools import lru_cache
 
 class Settings(BaseSettings):
     # ── Database ──────────────────────────────────────────────────────────────
-    DATABASE_URL: str = "postgresql+asyncpg://dukbus:dukbus@localhost:5432/dukbus"
+    DATABASE_URL: str
 
     # ── JWT ───────────────────────────────────────────────────────────────────
-    SECRET_KEY: str = "CHANGE_ME_IN_PRODUCTION_duk_bus_secret_2026"
+    SECRET_KEY: str
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_DAYS: int = 30   # long-lived; OTP-verified once only
 
     # ── GPS Hardware API key (same as old server) ─────────────────────────────
-    GPS_API_KEY: str = "DUK_BUS_2026_8xK92mQpL7_Zs7vQm91Ax4NdP"
+    GPS_API_KEY: str
 
     # ── Admin ─────────────────────────────────────────────────────────────────
-    ADMIN_TOKEN: str    = "CHANGE_ME_ADMIN_TOKEN"   # sent as X-Admin-Token header on every API call
-    ADMIN_USERNAME: str = "admin"                   # login username for the React dashboard
-    ADMIN_PASSWORD: str = "duk@2026"                # login password for the React dashboard
+    ADMIN_TOKEN: str
+    ADMIN_USERNAME: str
+    ADMIN_PASSWORD: str
 
     # ── SMTP (fill in when ready) ─────────────────────────────────────────────
     SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 587
-    SMTP_USER: str = "placeholder@gmail.com"
-    SMTP_PASSWORD: str = "PLACEHOLDER"
-    SMTP_FROM: str = "DUK Bus Tracker <placeholder@gmail.com>"
+    SMTP_USER: str
+    SMTP_PASSWORD: str
+    SMTP_FROM: str
 
     # ── Firebase FCM (fill in when ready) ────────────────────────────────────
-    FCM_SERVER_KEY: str = "PLACEHOLDER_FCM_SERVER_KEY"
-    FIREBASE_PROJECT_ID: str = "PLACEHOLDER_PROJECT_ID"
+    FCM_SERVER_KEY: str
+    FIREBASE_PROJECT_ID: str
 
     # ── Allowed email domain ──────────────────────────────────────────────────
     ALLOWED_EMAIL_DOMAIN: str = "duk.ac.in"
