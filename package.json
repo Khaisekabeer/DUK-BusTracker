@@ -1,6 +1,13 @@
 {
-  "dependencies": {
-    "react": "^19.2.8",
-    "react-native": "^0.84.1"
+  "name": "duk-bustracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DUK BusTracker repository containing backend API and frontend mobile app",
+  "scripts": {
+    "start:backend": "npm --prefix backend start",
+    "dev:backend": "npm --prefix backend dev",
+    "start:frontend": "npm --prefix frontend start",
+    "android": "npm --prefix frontend android",
+    "ios": "npm --prefix frontend ios"
   }
 }
