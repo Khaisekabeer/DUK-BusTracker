@@ -243,9 +243,7 @@ export default function ProfileSetupScreen({ navigation }: any) {
                         onPress={() => selectPoint(p)}
                         activeOpacity={0.65}
                       >
-                        <View style={[S.ddIcon, selectedPoint?.id === p.id && S.ddIconSelected]}>
-                          <Ionicons name="bus-outline" size={16} color={selectedPoint?.id === p.id ? Colors.black : Colors.mintDark} />
-                        </View>
+                      
                         <View style={{ flex: 1, paddingRight: 8 }}>
                           <Text style={S.ddName} numberOfLines={1}>{p.name}</Text>
                           <Text style={S.ddDesc} numberOfLines={1}>{p.desc}</Text>
