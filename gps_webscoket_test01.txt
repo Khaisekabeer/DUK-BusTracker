@@ -1,0 +1,1133 @@
+#include <HardwareSerial.h>
+#include <FastLED.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <Update.h>
+
+// ================= UART =================
+#define MODEM_RX 16
+#define MODEM_TX 17
+
+// ================= LED =================
+#define LED_PIN 21
+#define NUM_LEDS 3
+
+// ================= POWER =================
+#define POWER_SENSE_PIN 35
+#define BatVoltage_PIN 39
+
+HardwareSerial MODEM(1);
+CRGB leds[NUM_LEDS];
+
+// ================= GLOBAL =================
+float lat = 0.0;
+float lon = 0.0;
+float speed = 0.0;
+bool gpsOk = false;
+
+int failCount = 0;
+
+bool pendingPowerOn = false;
+bool pendingPowerOff = false;
+
+int resetHour = 0;
+int resetMinute = 0;
+bool resetDone = false;
+unsigned long lastResetCheck = 0;
+
+int nflag = 2;
+int pflag = 1;
+
+//String GPS = ""; 
+
+const char* VERSION_URL = "https://raw.githubusercontent.com/milma-can-lab/GPS_tracker/refs/heads/main/GPS_OTA_version.txt";
+const char* FW_BASE_URL = "https://raw.githubusercontent.com/milma-can-lab/GPS_tracker/main/GPS_G";
+
+String current_version = "1_0_2"; 
+String new_version = "0_0";  
+
+
+const String SUPABASE_HOST = "mtkdzcdzxtfjwpgnpujc.supabase.co";
+const int SUPABASE_PORT = 443;
+const String SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im10a2R6Y2R6eHRmandwZ25wdWpjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NDg5NDA5NCwiZXhwIjoyMTAwNDcwMDk0fQ.6s-3g9eEmxTP7tYdw22xqC6scLq7f7IC_1YFdv9NAOE";
+
+const String CHANNEL_TOPIC = "realtime:gps_realtime";
+int messageRef = 1;
+
+// ====================== HELPERS for OTA,Config and Payload Sending ======================
+
+void showResponse(unsigned long timeout = 5000) {
+  unsigned long start = millis();
+  while (millis() - start < timeout) {
+    while (MODEM.available()) {
+      Serial.write(MODEM.read());
+      start = millis();
+    }
+  }
+  Serial.println();
+}
+
+String cleanJson(const String& raw) {
+  int startIdx = raw.indexOf('{');
+  int endIdx = raw.lastIndexOf('}');
+  if (startIdx >= 0 && endIdx > startIdx) {
+    return raw.substring(startIdx, endIdx + 1);
+  } else {
+    Serial.println("[ERROR] Could not locate JSON in response!");
+    return "";
+  }
+}
+
+String parseVersionResponse(const String& response) {  //For filtering the version for config and OTA which commes combined with AT response of EC200U.
+  String clean = "";
+  String line = "";
+  for (int i = 0; i < response.length(); i++) {
+    char c = response[i];
+    if (c == '\r' || c == '\n') {
+      if (line.indexOf('_') > 0 && isDigit(line[0])) { //Filters by checking digit and '_'.
+        clean = line;
+        break;
+      }
+      line = "";
+    } else {
+      line += c;
+    }
+  }
+  return clean;
+}
+
+String httpGET(const char *url) {               //Get the Version OF config and OTA files.
+  MODEM.println("AT+QHTTPCFG=\"contextid\",1");
+  delay(200);
+  MODEM.print("AT+QHTTPURL=");
+  MODEM.print(strlen(url));
+  MODEM.println(",60");
+  delay(200);
+  showResponse();
+  MODEM.println(url);
+  delay(500);
+  showResponse();
+  MODEM.println("AT+QHTTPGET=80");  // 80s timeout
+  delay(2000);
+  showResponse();
+  MODEM.println("AT+QHTTPREAD=120");
+  delay(500);
+  String response = "";
+  unsigned long start = millis();
+  while (millis() - start < 5000) {
+    while (MODEM.available()) {
+      char c = MODEM.read();
+      response += c;
+      start = millis();
+    }
+  }
+  Serial.println("[HTTP Raw Response]");
+  Serial.println(response);
+  String parsed = parseVersionResponse(response);
+  Serial.println("[Parsed Version]");
+  Serial.println(parsed);
+  return parsed;
+}
+
+//===========================OTA Code================================
+bool checkForUpdate() {
+  Serial.println("Checking for update...");
+  String server_version = String(VERSION_URL);
+  String response = httpGET(server_version.c_str());
+
+  if (response.length() == 0) {
+    Serial.println("No valid version response");
+    return false;
+  }
+  new_version = response;
+  Serial.println("Current version: " + current_version);
+  Serial.println("Available version: " + new_version);
+
+  if (new_version != current_version) {
+    Serial.println("New firmware available!");
+    return true;
+  }
+  Serial.println("Already latest firmware.");
+  return false;
+}
+
+// ================== DOWNLOAD TO SPIFFS ==================
+bool downloadFirmwareToSPIFFS(bool clearBefore = true) { 
+            if (clearBefore) {
+              //Serial.println("[INFO] Clearing SPIFFS...");
+              if (!SPIFFS.format()) {
+                Serial.println("[ERROR] Failed to format SPIFFS!");
+                return false;
+              }
+              Serial.println("[INFO] SPIFFS cleared successfully.");
+             delay(2000); 
+            }
+
+  String fw_url_path = String(FW_BASE_URL) + new_version + ".bin";
+
+  String fw_url = fw_url_path;
+  
+  Serial.println("Downloading firmware to SPIFFS: " + fw_url);
+
+  String fw_filename = "/firmware_" + new_version + ".bin";
+  File fwFile = SPIFFS.open(fw_filename, FILE_WRITE);
+  if (!fwFile) {
+    Serial.println("[ERROR] Could not open file on SPIFFS!");
+    return false;
+  }
+
+  // Tell MODEM the URL
+  MODEM.print("AT+QHTTPURL=");
+  MODEM.print(fw_url.length());
+  MODEM.println(",60");
+  delay(200);
+  showResponse();
+  MODEM.println(fw_url);
+  delay(500);
+  showResponse();
+  // Start GET
+  MODEM.println("AT+QHTTPGET=120");
+  delay(3000);
+  // Capture GET response for size
+  String getResp = "";
+  unsigned long t0 = millis();
+  while (millis() - t0 < 5000) {
+    while (MODEM.available()) {
+      char c = MODEM.read();
+      getResp += c;
+      t0 = millis();
+    }
+  }
+  Serial.println(getResp);
+  int fw_size = 0;
+  int idx = getResp.indexOf("+QHTTPGET:");
+  if (idx >= 0) {
+    int c1 = getResp.indexOf(',', idx + 10);
+    int c2 = getResp.indexOf(',', c1 + 1);
+    if (c2 > 0) {
+      fw_size = getResp.substring(c2 + 1).toInt();
+    }
+  }
+  Serial.printf("Expected firmware size: %d bytes\n", fw_size);
+  if (fw_size <= 0) {
+    Serial.println("[ERROR] Could not parse firmware size!");
+    fwFile.close();
+    return false;
+  }
+  // Start streaming firmware
+  uint8_t buf[256];
+  size_t total_received = 0;
+  unsigned long t_start = millis();
+  bool data_mode = false;
+MODEM.println("AT+QHTTPREAD=120");
+  delay(10);
+  // --- Wait for exact CONNECT sequence ---
+  String headerBuffer = "";
+  while (!data_mode && millis() - t_start < 10000) {
+    while (MODEM.available()) {
+      char c = MODEM.read();
+      headerBuffer += c;
+
+      if (headerBuffer.indexOf("CONNECT\r\n") >= 0) {
+        Serial.println("[MODEM] CONNECT found, start binary download...");
+        data_mode = true;
+        break;
+      }
+    }
+  }
+  // --- Now read pure binary ---
+  while (total_received < fw_size && millis() - t_start < 12000) {
+    while (MODEM.available()) {
+      int remaining = fw_size - total_received;
+      int toRead = min((int)sizeof(buf), remaining);
+      int len = MODEM.readBytes((char*)buf, toRead);
+
+      if (len > 0) {
+        fwFile.write(buf, len);
+        total_received += len;
+
+        int lastPercent=0;
+        int percent = (total_received * 100) / fw_size;
+        Serial.printf("Downloading... %d%% (%d/%d)\n", percent, total_received, fw_size); 
+        if (percent % 5 == 0 && percent != lastPercent) {
+          Serial.printf("Downloading... %d%%\n", percent);
+          lastPercent = percent;
+        } 
+      }
+
+      t_start = millis();
+
+      if (total_received >= fw_size) {
+        break;
+      }
+    }
+  }
+
+  fwFile.close();
+  Serial.printf("Download complete: %d bytes written\n", total_received);
+
+  if (total_received != fw_size) {
+    Serial.printf("[ERROR] Download incomplete! Got %d of %d bytes\n", total_received, fw_size);
+    return false;
+  }
+  Serial.println("Firmware saved to SPIFFS successfully!");
+  Serial.printf("[READY] Firmware file prepared: /firmware_%s.bin\n", new_version.c_str());
+  return true;
+}
+
+// ================== FLASH FROM SPIFFS ==================
+bool flashFirmwareFromSPIFFS(const char* path) {
+  File fwFile = SPIFFS.open(path);
+  if (!fwFile) {
+    Serial.println("[ERROR] Cannot open firmware file on SPIFFS!");
+    return false;
+  }
+  size_t fwSize = fwFile.size();
+  Serial.printf("Flashing firmware from SPIFFS: %s (%d bytes)\n", path, fwSize);
+
+  if (!Update.begin(fwSize)) { 
+    Serial.println("[ERROR] Not enough space for OTA!");
+    fwFile.close();
+    return false;
+  }
+  uint8_t buf[256];
+  size_t written = 0;
+  while (fwFile.available()) {
+    int len = fwFile.read(buf, sizeof(buf));
+    if (len > 0) {
+      Update.write(buf, len);
+      written += len;
+
+      int percent = (written * 100) / fwSize;
+      Serial.printf("Flashing... %d%% (%d/%d)\n", percent, written, fwSize);
+    } else {
+      delay(1);
+    }
+  }
+
+  fwFile.close();
+
+  if (Update.end() && Update.isFinished()) {
+    Serial.println("OTA update complete! Restarting...");
+    delay(1000);
+    ESP.restart();
+    return true;
+  } else {
+    Serial.printf("[ERROR] OTA failed! Error code: %d\n", Update.getError());
+    return false;
+  }
+}
+
+//================== PERFORM OTA FUNCTION ==================
+void performOTAUpdate() {
+  Serial.println("=== OTA Update Process Started ===");
+
+  // ---------- Step 1: Mount SPIFFS safely ----------
+  if (!SPIFFS.begin(true)) {
+    Serial.println("[ERROR] SPIFFS Mount Failed! Trying to format...");
+    if (!SPIFFS.format()) {
+      Serial.println("[FATAL] SPIFFS format failed. Aborting OTA.");
+      return;
+    }
+    if (!SPIFFS.begin(true)) {
+      Serial.println("[FATAL] SPIFFS still not mountable after format. Aborting.");
+      return;
+    }
+  }
+  Serial.println("[OK] SPIFFS mounted successfully.");
+
+  // ---------- Step 2: Check for update ----------
+  if (!checkForUpdate()) {
+    Serial.println("[INFO] No update required.");
+    Serial.println("=== OTA Update Process Completed ===");
+    return;
+  }
+
+  Serial.println("[INFO] Update available, starting download...");
+
+  // ---------- OTA RETRY LOOP (3 attempts) ----------
+  const int maxOTARetries = 3;
+  bool otaSuccess = false;
+
+  for (int attempt = 1; attempt <= maxOTARetries; attempt++) {
+
+    Serial.printf("\n[OTA] ===== Attempt %d of %d =====\n", attempt, maxOTARetries);
+
+    // ---------- Step 3: Download firmware ----------
+    if (downloadFirmwareToSPIFFS()) {
+      String fw_filename = "/firmware_" + new_version + ".bin";
+      Serial.printf("[INFO] Firmware file prepared: %s\n", fw_filename.c_str());
+
+      // ---------- Step 4: Flash firmware ----------
+      if (flashFirmwareFromSPIFFS(fw_filename.c_str())) {
+        Serial.println("[SUCCESS] OTA update complete.");
+        otaSuccess = true;
+        break;   // exit retry loop
+      } 
+      else {
+        Serial.println("[ERROR] Flashing firmware failed!");
+      }
+    } 
+    else {
+      Serial.println("[ERROR] Firmware download failed!");
+    }
+
+    // If failed and more retries left
+    if (attempt < maxOTARetries) {
+      Serial.println("[OTA] Retrying in 3 seconds...");
+      delay(3000);
+    }
+  }
+
+  // ---------- Final status ----------
+  if (!otaSuccess) {
+    Serial.println("[FATAL] OTA FAILED after 3 attempts. Continuing normal operation...");
+  }
+
+  Serial.println("=== OTA Update Process Completed ===");
+}
+
+// ================= AT FUNCTION =================
+String sendAT(String cmd, int timeout = 1000) {
+
+  MODEM.println(cmd);
+
+  String resp = "";
+  unsigned long start = millis();
+
+  while (millis() - start < timeout) {
+    while (MODEM.available()) {
+      resp += (char)MODEM.read();
+    }
+  }
+
+  // Anti-stuck protection
+  if (resp.length() == 0) {
+    failCount++;
+    if (failCount > 3) ESP.restart();
+  } else {
+    failCount = 0;
+  }
+
+  return resp;
+}
+
+// ================= MIDNIGHT RESET =================
+bool getCurrentTime(int &hour, int &minute) {
+
+  String resp = sendAT("AT+CCLK?", 1000);
+
+  int idx = resp.indexOf("\"");
+  if (idx == -1) return false;
+
+  String s = resp.substring(idx + 1, idx + 20);
+
+  hour = s.substring(9, 11).toInt();
+  minute = s.substring(12, 14).toInt();
+
+  return true;
+}
+
+void checkMidnightReset() {
+
+  if (millis() - lastResetCheck < 60000) return;
+  lastResetCheck = millis();
+
+  int hour, minute;
+
+  if (!getCurrentTime(hour, minute)) return;
+
+  if (hour == resetHour && minute == resetMinute && !resetDone) {
+    Serial.println("[RESET] Midnight reset");
+    delay(2000);
+    ESP.restart();
+  }
+
+  //if (hour != resetHour) resetDone = false;
+  if (hour != resetHour || minute != resetMinute) {
+  resetDone = false;
+  }
+}
+
+
+void websocketDisconnect()
+{
+    sendAT("AT+QSSLCLOSE=1", 3000);
+
+    Serial.println("[WSS] CLOSED");
+}
+
+// ========================= SERVER ========================
+bool httpPostServerFast(String payload)
+{
+    static bool wsConnected = false;
+    if (!wsConnected)
+    {
+        Serial.println("[WSS] SSL CONFIG");
+        sendAT("AT+QSSLCFG=\"sslversion\",1,4");
+        Serial.println(sendAT("AT+QSSLCFG=\"sslversion\",1,4"));
+        sendAT("AT+QSSLCFG=\"seclevel\",1,0");
+        Serial.println(sendAT("AT+QSSLCFG=\"seclevel\",1,0"));
+        sendAT("AT+QSSLCFG=\"sni\",1,1");
+        Serial.println(sendAT("AT+QSSLCFG=\"sni\",1,1"));
+        Serial.println("[WSS] OPEN");
+
+        String resp = sendAT(
+            "AT+QSSLOPEN=1,1,1,\"" + SUPABASE_HOST + "\"," + String(SUPABASE_PORT) + ",0",
+            8000
+        );
+
+        Serial.println(resp);
+
+        if (resp.indexOf("+QSSLOPEN: 1,0") == -1)
+        {
+            Serial.println("[WSS] SSL OPEN FAIL");
+            websocketDisconnect();
+            return false;
+        }
+
+        String handshake =
+            "GET /realtime/v1/websocket?apikey=" + SUPABASE_SERVICE_KEY + "&vsn=1.0.0 HTTP/1.1\r\n"
+            "Host: " + SUPABASE_HOST + "\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "Authorization: Bearer " + SUPABASE_SERVICE_KEY + "\r\n"
+            "\r\n";
+
+        String cmd =
+            "AT+QSSLSEND=1," +
+            String(handshake.length());
+        resp = sendAT(cmd, 3000);
+
+      if (resp.indexOf(">") == -1)
+      {
+          Serial.println("[WSS] HANDSHAKE SEND FAIL");
+          websocketDisconnect();
+          return false;
+      }
+
+      // ===== Print the handshake request =====
+      Serial.println("\n========== HANDSHAKE REQUEST ==========");
+      Serial.println(handshake);
+      Serial.println("=======================================");
+
+      // ===== Send the handshake =====
+      MODEM.print(handshake);
+
+      Serial.println("[WSS] HANDSHAKE SENT");
+        
+        /*String wsResp = "";
+        unsigned long start = millis();
+        while (millis() - start < 5000)
+        {
+            String recvResp =
+                sendAT(
+                    "AT+QSSLRECV=1,1024",
+                    500);
+
+            wsResp += recvResp;
+
+            if (wsResp.indexOf("101 Switching Protocols") != -1)
+            {
+                break;
+            }
+
+            delay(200);
+        }
+
+        if (wsResp.indexOf("101 Switching Protocols") == -1)
+        {
+            Serial.println("[WSS] HANDSHAKE FAIL");
+            websocketDisconnect();
+            return false;
+        }
+
+        wsConnected = true;
+        Serial.println("[WSS] CONNECTED");
+    }*/
+    String wsResp = "";
+    unsigned long start = millis();
+
+    while (millis() - start < 5000)
+    {
+        String recvResp = sendAT("AT+QSSLRECV=1,1024", 500);
+
+        if (recvResp.length() > 0)
+        {
+            Serial.println("\n========== QSSLRECV RESPONSE ==========");
+            Serial.println(recvResp);
+            Serial.println("=======================================");
+        }
+
+        wsResp += recvResp;
+
+        if (wsResp.indexOf("101 Switching Protocols") != -1)
+        {
+            break;
+        }
+
+        delay(200);
+    }
+
+    Serial.println("\n========== FULL HANDSHAKE RESPONSE ==========");
+    Serial.println(wsResp);
+    Serial.println("=============================================");
+
+    if (wsResp.indexOf("101 Switching Protocols") == -1)
+    {
+        Serial.println("[WSS] HANDSHAKE FAIL");
+        websocketDisconnect();
+        return false;
+    }
+
+    wsConnected = true;
+    Serial.println("[WSS] CONNECTED");
+    }
+
+    /*if (pendingPowerOn)
+    {
+        Serial.println("[RESEND] POWER_ON");
+        pendingPowerOn = false;
+        httpPostServerFast("POWER_ON");
+    }
+    if (pendingPowerOff)
+    {
+        Serial.println("[RESEND] POWER_OFF");
+        pendingPowerOff = false;
+        httpPostServerFast("POWER_OFF");
+    }*/
+
+    if (pendingPowerOn)
+{
+    Serial.println("[RESEND] POWER_ON");
+    pendingPowerOn = false;
+    httpPostServerFast("{\"event\":\"POWER_ON\"}");
+}
+
+if (pendingPowerOff)
+{
+    Serial.println("[RESEND] POWER_OFF");
+    pendingPowerOff = false;
+    httpPostServerFast("{\"event\":\"POWER_OFF\"}");
+}
+
+    int len = payload.length();
+
+    if (len > 500)/////will change 
+    {
+        Serial.println("[WSS] PAYLOAD TOO LARGE");
+        return false;
+    }
+
+    uint8_t frame[512];
+    uint8_t mask[4];
+
+    mask[0] = random(0, 256);
+    mask[1] = random(0, 256);
+    mask[2] = random(0, 256);
+    mask[3] = random(0, 256);
+
+    frame[0] = 0x81;
+    frame[1] = 0x80 | len;
+
+    frame[2] = mask[0];
+    frame[3] = mask[1];
+    frame[4] = mask[2];
+    frame[5] = mask[3];
+
+    for (int i = 0; i < len; i++)
+    {
+        frame[6 + i] =
+            ((uint8_t)payload[i]) ^
+            mask[i % 4];
+    }
+
+    int frameLen = len + 6;
+
+    String cmd =
+        "AT+QSSLSEND=1," +
+        String(frameLen);
+    String resp =
+        sendAT(cmd, 3000);
+
+    if (resp.indexOf(">") == -1)
+    {
+        Serial.println("[WSS] SEND FAIL");
+        websocketDisconnect();
+        wsConnected = false;
+        return false;
+    }
+
+    MODEM.write(frame, frameLen);
+    Serial.println("[WSS] PAYLOAD SENT");
+    return true;
+}
+
+// ================= GPS =================
+bool getGPS() {
+
+  Serial.println("\n[GPS] Reading...");
+
+  String gpsResponse = sendAT("AT+QGPSLOC=2", 500);
+
+  int idx = gpsResponse.indexOf("+QGPSLOC:");
+
+  if (idx != -1) {
+
+    gpsResponse.trim();
+
+    Serial.println("[GPS DATA]");
+    Serial.println(gpsResponse);
+
+    // Extract only the data after "+QGPSLOC: "
+    String data = gpsResponse.substring(idx + 10);
+    data.trim();
+
+    // Split comma-separated fields
+    int p1 = data.indexOf(',');
+    int p2 = data.indexOf(',', p1 + 1);
+    int p3 = data.indexOf(',', p2 + 1);
+    int p4 = data.indexOf(',', p3 + 1);
+    int p5 = data.indexOf(',', p4 + 1);
+    int p6 = data.indexOf(',', p5 + 1);
+    int p7 = data.indexOf(',', p6 + 1);
+    int p8 = data.indexOf(',', p7 + 1);
+
+    // Latitude
+    lat = data.substring(p1 + 1, p2).toFloat();
+
+    // Longitude
+    lon = data.substring(p2 + 1, p3).toFloat();
+
+    // Speed (km/h)
+    speed = data.substring(p7 + 1, p8).toFloat();
+
+    Serial.printf("[PARSED] Lat : %.6f\n", lat);
+    Serial.printf("[PARSED] Lon : %.6f\n", lon);
+    Serial.printf("[PARSED] Speed : %.1f km/h\n", speed);
+
+    gpsOk = true;
+    return true;
+  }
+
+  gpsOk = false;
+  Serial.println("[GPS] NO FIX");
+  return false;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+String createRealtimeEnvelope(String eventName, float lat = 0, float lon = 0, float speed = 0)
+{
+    String payload;
+
+    if (eventName == "GPS")
+    {
+        payload =
+            "{"
+              "\"topic\":\"" + CHANNEL_TOPIC + "\","
+              "\"event\":\"broadcast\","
+              "\"payload\":{"
+                  "\"type\":\"broadcast\","
+                  "\"event\":\"GPS\","
+                  "\"payload\":{"
+                      "\"lat\":" + String(lat, 6) + ","
+                      "\"lon\":" + String(lon, 6) + ","
+                      "\"speed\":" + String(speed, 1) +
+                  "}"
+              "},"
+              "\"ref\":\"" + String(messageRef++) + "\""
+            "}";
+
+    }
+    else
+    {
+        payload =
+            "{"
+              "\"topic\":\"" + CHANNEL_TOPIC + "\","
+              "\"event\":\"broadcast\","
+              "\"payload\":{"
+                  "\"type\":\"broadcast\","
+                  "\"event\":\"" + eventName + "\","
+                  "\"payload\":{}"
+              "},"
+              "\"ref\":\"" + String(messageRef++) + "\""
+            "}";
+    }
+
+    return payload;
+}
+////////////////////////////////////////////remove after test
+
+// ================= NETWORK =================
+void checkNetwork() {
+  String resp = sendAT("AT+CSQ", 1000);
+
+  int rssi = -1;
+  int idx = resp.indexOf("+CSQ:");
+
+  if (idx != -1) {
+    int comma = resp.indexOf(",", idx);
+    rssi = resp.substring(idx + 6, comma).toInt();
+  }
+
+  if (rssi == -1 || rssi == 99) nflag = 2;
+  else if (rssi < 10) nflag = 2;
+  else if (rssi < 15) nflag = 1;
+  else nflag = 0;
+}
+
+// ================= POWER =================
+float readPinVoltage(int pin) {
+  return (analogRead(pin) / 4095.0) * 3.3;
+}
+
+float readExternalVoltage() {
+  return readPinVoltage(POWER_SENSE_PIN) * ((100000.0 + 33000.0) / 33000.0);
+}
+
+void checkPower() {
+  float extVin = readExternalVoltage();
+
+  if (extVin > 0.2) pflag = 0;
+  else pflag = 1;
+}
+
+// ================= LED =================
+void updateLEDs(bool sending) {
+
+  leds[0] = gpsOk ? CRGB(0,255,0) : CRGB(255,0,0);
+
+  if (sending) leds[1] = CRGB(0,0,255);
+  else leds[1] = (nflag == 0) ? CRGB(0,255,0) :
+                 (nflag == 1) ? CRGB(255,165,0) : CRGB(255,0,0);
+
+  leds[2] = (pflag == 0) ? CRGB(0,255,0) :
+            (pflag == 1) ? CRGB(255,165,0) : CRGB(255,0,0);
+
+  FastLED.show();
+}
+
+// ================= INITIALIZATION =================
+void initialization() {
+
+  Serial.println("\n[DEBUG] ===== INITIALIZATION START =====");
+
+  MODEM.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  delay(500);
+
+  sendAT("AT");
+  sendAT("AT+CFUN=1,1");
+  delay(5000);
+
+  sendAT("AT+CPIN?");
+  sendAT("AT+CREG?");
+  sendAT("AT+CGATT?");
+
+  sendAT("AT+QGPS=1");
+
+  // LED INIT
+  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(150);
+  FastLED.clear();
+  FastLED.show();
+
+  // POWER ADC INIT
+  analogSetPinAttenuation(POWER_SENSE_PIN, ADC_11db);
+  analogSetPinAttenuation(BatVoltage_PIN, ADC_11db);
+
+  Serial.println("[DEBUG] ===== INITIALIZATION COMPLETE =====\n");
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  pinMode(18, OUTPUT);
+  digitalWrite(18, HIGH);
+  initialization();
+  performOTAUpdate();
+  randomSeed(millis());
+}
+
+// ================= LOOP =================
+/*void loop() {
+
+  digitalWrite(18, HIGH);
+  checkMidnightReset();
+  checkNetwork();
+  checkPower();
+
+  static bool prevPowerState = false;
+  bool currentPowerState = (pflag == 0);
+
+// Helper to print + send
+  auto sendData = [&](String data) {
+  Serial.println("\n[RAW SEND]");
+  Serial.println(data);        
+  updateLEDs(true);
+  bool ok = httpPostServerFast(data);
+
+  if (!ok)
+  {
+      if (data == "POWER_ON")
+      {
+          pendingPowerOn = true;
+          Serial.println("[QUEUE] POWER_ON");
+      }
+
+      else if (data == "POWER_OFF")
+      {
+          pendingPowerOff = true;
+          Serial.println("[QUEUE] POWER_OFF");
+      }
+  }
+};
+
+//POWER ON (edge)
+  if (currentPowerState && !prevPowerState) {
+
+  Serial.println("\n[EVENT] POWER ON");
+  sendData("POWER_ON");
+
+  if (getGPS()) {
+    sendData(GPS);
+  }
+}
+
+//POWER OFF (edge)
+  else if (!currentPowerState && prevPowerState) {
+
+  Serial.println("\n[EVENT] POWER OFF");
+  sendData("POWER_OFF");
+
+  if (getGPS()) {
+    sendData(GPS);
+  }
+}
+
+//NORMAL GPS (power ON)
+  else if (currentPowerState) {
+
+  if (getGPS()) {
+    Serial.println("\n[EVENT] GPS");
+    sendData(GPS);
+  }
+}
+
+// NO SEND
+  else {
+  Serial.println("\n[NO SEND]");
+}
+
+//update state
+  prevPowerState = currentPowerState;
+  updateLEDs(false);
+  delay(1000);
+}*/
+
+/*void loop() {
+
+  digitalWrite(18, HIGH);
+
+  checkMidnightReset();
+  checkNetwork();
+  checkPower();
+
+  static bool prevPowerState = false;
+  bool currentPowerState = (pflag == 0);
+
+  // Helper to print + send
+  auto sendData = [&](String data) {
+
+    Serial.println("\n[JSON SEND]");
+    Serial.println(data);
+
+    updateLEDs(true);
+
+    bool ok = httpPostServerFast(data);
+
+    if (!ok) {
+
+      if (data == "{\"event\":\"POWER_ON\"}") {
+
+        pendingPowerOn = true;
+        Serial.println("[QUEUE] POWER_ON");
+
+      }
+      else if (data == "{\"event\":\"POWER_OFF\"}") {
+
+        pendingPowerOff = true;
+        Serial.println("[QUEUE] POWER_OFF");
+      }
+    }
+  };
+
+  // ================= POWER ON =================
+  if (currentPowerState && !prevPowerState) {
+
+    Serial.println("\n[EVENT] POWER ON");
+
+    sendData("{\"event\":\"POWER_ON\"}");
+
+    if (getGPS()) {
+
+      String gpsJson =
+          "{\"event\":\"GPS\","
+          "\"lat\":" + String(lat, 6) + ","
+          "\"lon\":" + String(lon, 6) + ","
+          "\"speed\":" + String(speed, 1) +
+          "}";
+
+      sendData(gpsJson);
+    }
+  }
+
+  // ================= POWER OFF =================
+  else if (!currentPowerState && prevPowerState) {
+
+    Serial.println("\n[EVENT] POWER OFF");
+
+    sendData("{\"event\":\"POWER_OFF\"}");
+
+    if (getGPS()) {
+
+      String gpsJson =
+          "{\"event\":\"GPS\","
+          "\"lat\":" + String(lat, 6) + ","
+          "\"lon\":" + String(lon, 6) + ","
+          "\"speed\":" + String(speed, 1) +
+          "}";
+
+      sendData(gpsJson);
+    }
+  }
+
+  // ================= NORMAL GPS =================
+  else if (currentPowerState) {
+
+    if (getGPS()) {
+
+      Serial.println("\n[EVENT] GPS");
+
+      String gpsJson =
+          "{\"event\":\"GPS\","
+          "\"lat\":" + String(lat, 6) + ","
+          "\"lon\":" + String(lon, 6) + ","
+          "\"speed\":" + String(speed, 1) +
+          "}";
+
+      sendData(gpsJson);
+    }
+  }
+
+  // ================= NO SEND =================
+  else {
+
+    Serial.println("\n[NO SEND]");
+  }
+
+  prevPowerState = currentPowerState;
+
+  updateLEDs(false);
+
+  delay(1000);
+}
+*/
+
+void loop() {
+
+  digitalWrite(18, HIGH);
+
+  checkMidnightReset();
+  checkNetwork();
+  checkPower();
+
+  static bool prevPowerState = false;
+  bool currentPowerState = (pflag == 0);
+
+  // Helper to print + send
+  auto sendData = [&](String data) {
+
+    Serial.println("\n[JSON SEND]");
+    Serial.println(data);
+
+    updateLEDs(true);
+
+    bool ok = httpPostServerFast(data);
+
+    if (!ok) {
+
+      if (data == createRealtimeEnvelope("POWER_ON")) {
+
+        pendingPowerOn = true;
+        Serial.println("[QUEUE] POWER_ON");
+
+      }
+      else if (data == createRealtimeEnvelope("POWER_OFF")) {
+
+        pendingPowerOff = true;
+        Serial.println("[QUEUE] POWER_OFF");
+      }
+    }
+  };
+
+  // ================= POWER ON =================
+  if (currentPowerState && !prevPowerState) {
+
+    Serial.println("\n[EVENT] POWER ON");
+
+    sendData(createRealtimeEnvelope("POWER_ON"));
+
+    if (getGPS()) {
+
+      sendData(createRealtimeEnvelope("GPS", lat, lon, speed));
+
+    }
+  }
+
+  // ================= POWER OFF =================
+  else if (!currentPowerState && prevPowerState) {
+
+    Serial.println("\n[EVENT] POWER OFF");
+
+    sendData(createRealtimeEnvelope("POWER_OFF"));
+
+    if (getGPS()) {
+
+      sendData(createRealtimeEnvelope("GPS", lat, lon, speed));
+
+    }
+  }
+
+  // ================= NORMAL GPS =================
+  else if (currentPowerState) {
+
+    if (getGPS()) {
+
+      Serial.println("\n[EVENT] GPS");
+
+      sendData(createRealtimeEnvelope("GPS", lat, lon, speed));
+
+    }
+  }
+
+  // ================= NO SEND =================
+  else {
+
+    Serial.println("\n[NO SEND]");
+
+  }
+
+  prevPowerState = currentPowerState;
+
+  updateLEDs(false);
+
+  delay(1000);
+}
+
+
+
+
+
+
