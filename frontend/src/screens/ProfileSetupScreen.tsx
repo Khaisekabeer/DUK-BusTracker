@@ -5,6 +5,7 @@
  */
 
 import React, { useState, useRef, useEffect } from 'react';
+import { authApi, trackingApi } from '../services/api';
 import {
   View,
   Text,
@@ -18,26 +19,17 @@ import {
   StyleSheet,
   LayoutAnimation,
   Keyboard,
-  Image
+  Image,
+  ActivityIndicator,
+  Modal,
+  FlatList,
 } from 'react-native';
 import Ionicons from '@react-native-vector-icons/ionicons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Colors from '../theme/colors';
+import OtpModal from '../components/OtpModal';
 
 const EMAIL_DOMAINS = ['@duk.ac.in', '@iitmk.ac.in'];
-
-const DEFAULT_BUS_POINTS = [
-  { id: 1,  name: 'Central Polytechnic',      desc: 'Starting point' },
-  { id: 2,  name: 'Vattiyoorkavu Jn',         desc: 'Vattiyoorkavu junction' },
-  { id: 5,  name: 'Sasthamangalam',           desc: 'Main road' },
-  { id: 9,  name: 'Pattom',                   desc: 'Pattom palace junction' },
-  { id: 10, name: 'Kesavadasapuram',          desc: 'Near MG College' },
-  { id: 13, name: 'Sreekaryam',               desc: 'Main road junction' },
-  { id: 15, name: 'Karyavattom',              desc: 'Near LNCPE' },
-  { id: 17, name: 'Technopark Front',         desc: 'Technopark Phase 1' },
-  { id: 18, name: 'Kazhakuttam',              desc: 'NH 66 bus stop' },
-  { id: 20, name: 'Digital University Kerala', desc: 'Final stop — DUK campus' },
-];
 
 export default function ProfileSetupScreen({ navigation }: any) {
   const emailRef = useRef<TextInput>(null);
@@ -48,6 +40,13 @@ export default function ProfileSetupScreen({ navigation }: any) {
   const [domainDropOpen, setDomainDropOpen] = useState(false);
   const [selectedPoint, setSelected]        = useState<any>(null);
   const [dropdownOpen, setDropdown]         = useState(false);
+  
+  const [stops, setStops]                   = useState<any[]>([]);
+  const [loadingStops, setLoadingStops]     = useState(true);
+  const [loading, setLoading]               = useState(false);
+  const [errorMsg, setErrorMsg]             = useState('');
+
+  const [otpModalVisible, setOtpModalVisible] = useState(false);
 
   // Animations
   const cardScale   = useRef(new Animated.Value(0.95)).current;
@@ -61,7 +60,14 @@ export default function ProfileSetupScreen({ navigation }: any) {
       Animated.timing(cardScale,   { toValue: 1, duration: 400, useNativeDriver: true }),
       Animated.timing(cardY,       { toValue: 0, duration: 400, useNativeDriver: true }),
     ]).start();
+    
+    trackingApi.getStops()
+      .then(res => setStops(res.data))
+      .catch(err => console.error("Failed to fetch stops", err))
+      .finally(() => setLoadingStops(false));
   }, [cardOpacity, cardScale, cardY]);
+
+  const fullEmail = `${emailPrefix.trim().toLowerCase()}${selectedDomain}`;
 
   // Validation
   const nameOk   = name.trim().length > 0;
@@ -97,14 +103,25 @@ export default function ProfileSetupScreen({ navigation }: any) {
     setDomainDropOpen(false);
   };
 
-  const handleContinue = () => {
+  const handleContinue = async () => {
     if (!formValid) return;
-    const fullEmail = `${emailPrefix.trim().toLowerCase()}${selectedDomain}`;
-    navigation?.navigate('OtpVerify', {
-      email: fullEmail,
-      name: name.trim(),
-      boardingPoint: selectedPoint,
-    });
+    setErrorMsg('');
+    setLoading(true);
+
+    try {
+      await authApi.register(name.trim(), fullEmail, selectedPoint.id);
+      setOtpModalVisible(true);
+    } catch (err: any) {
+      const detail = err.response?.data?.detail || '';
+      // If already registered, still open OTP modal so they can verify
+      if (detail.toLowerCase().includes('already') || detail.toLowerCase().includes('registered')) {
+        setOtpModalVisible(true);
+      } else {
+        setErrorMsg(detail || 'Failed to register. Please try again.');
+      }
+    } finally {
+      setLoading(false);
+    }
   };
 
   const arrowSpin = arrowRot.interpolate({ inputRange: [0, 1], outputRange: ['0deg', '180deg'] });
@@ -132,7 +149,7 @@ export default function ProfileSetupScreen({ navigation }: any) {
           <Animated.View style={[S.card, { opacity: cardOpacity, transform: [{ scale: cardScale }, { translateY: cardY }] }]}>
 
             <Text style={S.cardHeading}>Set up your profile</Text>
-            <Text style={S.cardSub}>Use your university email to verify access</Text>
+            <Text style={S.cardSub}>Use your email to verify access</Text>
 
             {/* Name field */}
             <View style={[S.formGroup, { zIndex: 1 }]}>
@@ -149,9 +166,9 @@ export default function ProfileSetupScreen({ navigation }: any) {
               />
             </View>
 
-            {/* Email field — prefix input + domain dropdown */}
+            {/* Email field */}
             <View style={[S.formGroup, { zIndex: domainDropOpen ? 50 : 2 }]}>
-              <Text style={S.formLabel}>University Email</Text>
+              <Text style={S.formLabel}>Email</Text>
               <View style={[
                 S.emailRow,
                 prefixOk && S.emailRowFilled,
@@ -160,7 +177,7 @@ export default function ProfileSetupScreen({ navigation }: any) {
                 <TextInput
                   ref={emailRef}
                   style={S.emailPrefixInput}
-                  placeholder="yourname"
+                  placeholder="Enter Email"
                   placeholderTextColor={Colors.medGray}
                   value={emailPrefix}
                   onChangeText={setEmailPrefix}
@@ -192,7 +209,6 @@ export default function ProfileSetupScreen({ navigation }: any) {
                 </View>
               )}
 
-              {/* Domain dropdown */}
               {domainDropOpen && (
                 <View style={S.domainDropdown}>
                   {EMAIL_DOMAINS.map(d => (
@@ -210,8 +226,8 @@ export default function ProfileSetupScreen({ navigation }: any) {
               )}
             </View>
 
-            {/* Boarding stop dropdown */}
-            <View style={[S.formGroup, { zIndex: dropdownOpen ? 100 : 3 }]}>
+            {/* Boarding stop — tapping opens a Modal overlay */}
+            <View style={[S.formGroup, { zIndex: 3 }]}>
               <Text style={S.formLabel}>Boarding Stop</Text>
               <TouchableOpacity
                 style={[S.formInput, S.dropdownTrigger, selectedPoint && S.formInputFilled]}
@@ -225,51 +241,85 @@ export default function ProfileSetupScreen({ navigation }: any) {
                   <Ionicons name="chevron-down" size={18} color={Colors.black} />
                 </Animated.View>
               </TouchableOpacity>
-
-              {dropdownOpen && (
-                <View style={S.dropdownList}>
-                  <ScrollView
-                    nestedScrollEnabled={true}
-                    showsVerticalScrollIndicator={true}
-                    persistentScrollbar={true}
-                    keyboardShouldPersistTaps="handled"
-                    style={S.dropdownScrollView}
-                    contentContainerStyle={S.dropdownScrollContent}
-                  >
-                    {DEFAULT_BUS_POINTS.map(p => (
-                      <TouchableOpacity
-                        key={p.id}
-                        style={[S.dropdownItem, selectedPoint?.id === p.id && S.dropdownItemSelected]}
-                        onPress={() => selectPoint(p)}
-                        activeOpacity={0.65}
-                      >
-                      
-                        <View style={{ flex: 1, paddingRight: 8 }}>
-                          <Text style={S.ddName} numberOfLines={1}>{p.name}</Text>
-                          <Text style={S.ddDesc} numberOfLines={1}>{p.desc}</Text>
-                        </View>
-                        {selectedPoint?.id === p.id && <Ionicons name="checkmark-circle" size={18} color={Colors.mintDark} />}
-                      </TouchableOpacity>
-                    ))}
-                  </ScrollView>
-                </View>
-              )}
             </View>
 
-            {/* Continue button */}
+            {/* Stop picker Modal */}
+            <Modal
+              visible={dropdownOpen}
+              transparent
+              animationType="slide"
+              onRequestClose={() => { setDropdown(false); }}
+            >
+              <View style={S.stopModalOverlay}>
+                <TouchableOpacity style={S.stopModalBg} activeOpacity={1} onPress={() => setDropdown(false)} />
+                <View style={S.stopModalSheet}>
+                  <View style={S.stopModalHeader}>
+                    <Text style={S.stopModalTitle}>Select Boarding Stop</Text>
+                    <TouchableOpacity onPress={() => setDropdown(false)} style={S.stopModalClose}>
+                      <Ionicons name="close" size={22} color={Colors.black} />
+                    </TouchableOpacity>
+                  </View>
+                  {loadingStops ? (
+                    <ActivityIndicator size="large" color={Colors.mint} style={{ marginVertical: 40 }} />
+                  ) : (
+                    <FlatList
+                      data={stops}
+                      keyExtractor={item => String(item.id)}
+                      showsVerticalScrollIndicator={true}
+                      contentContainerStyle={{ paddingBottom: 24, paddingHorizontal: 8 }}
+                      keyboardShouldPersistTaps="handled"
+                      renderItem={({ item: p }) => (
+                        <TouchableOpacity
+                          style={[S.dropdownItem, selectedPoint?.id === p.id && S.dropdownItemSelected]}
+                          onPress={() => selectPoint(p)}
+                          activeOpacity={0.65}
+                        >
+                          <View style={{ flex: 1, paddingRight: 8 }}>
+                            <Text style={S.ddName} numberOfLines={1}>{p.name}</Text>
+                          </View>
+                          {selectedPoint?.id === p.id && <Ionicons name="checkmark-circle" size={18} color={Colors.mintDark} />}
+                        </TouchableOpacity>
+                      )}
+                    />
+                  )}
+                </View>
+              </View>
+            </Modal>
+
+            {errorMsg ? (
+              <Text style={{ color: Colors.danger, fontSize: 13, marginBottom: 12, textAlign: 'center' }}>
+                {errorMsg}
+              </Text>
+            ) : null}
+
             <TouchableOpacity
-              style={[S.continueBtn, !formValid && S.continueBtnDisabled]}
+              style={[S.continueBtn, (!formValid || loading) && S.continueBtnDisabled]}
               onPress={handleContinue}
-              disabled={!formValid}
+              disabled={!formValid || loading}
               activeOpacity={0.7}
             >
-              <Text style={S.continueBtnText}>Send Verification Code</Text>
-              <Ionicons name="arrow-forward" size={18} color={Colors.black} />
+              {loading ? (
+                <ActivityIndicator size="small" color={Colors.black} />
+              ) : (
+                <>
+                  <Text style={S.continueBtnText}>Send Verification Code</Text>
+                  <Ionicons name="arrow-forward" size={18} color={Colors.black} />
+                </>
+              )}
             </TouchableOpacity>
 
           </Animated.View>
         </ScrollView>
       </KeyboardAvoidingView>
+
+      <OtpModal
+        visible={otpModalVisible}
+        onClose={() => setOtpModalVisible(false)}
+        email={fullEmail}
+        name={name}
+        boardingPointId={selectedPoint?.id}
+        navigation={navigation}
+      />
     </SafeAreaView>
   );
 }
@@ -315,10 +365,14 @@ const S = StyleSheet.create({
   dropdownTextPlaceholder: { color: Colors.medGray },
   dropdownTextSelected:  { color: Colors.black, fontWeight: '600' },
   
-  dropdownList:          { position: 'absolute', top: 82, left: 0, right: 0, backgroundColor: Colors.white, borderWidth: 1.5, borderColor: Colors.border, borderRadius: 16, shadowColor: '#000', shadowOffset: { width: 0, height: 12 }, shadowOpacity: 0.15, shadowRadius: 30, elevation: 24, zIndex: 100, overflow: 'hidden' },
-  dropdownScrollView:    { maxHeight: 240 },
-  dropdownScrollContent: { paddingVertical: 6, paddingHorizontal: 6 },
-  dropdownItem:          { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10, paddingHorizontal: 12, borderRadius: 12, marginVertical: 2 },
+  // Stop picker modal
+  stopModalOverlay:      { flex: 1, justifyContent: 'flex-end' },
+  stopModalBg:           { ...StyleSheet.absoluteFill, backgroundColor: 'rgba(0,0,0,0.45)' },
+  stopModalSheet:        { backgroundColor: Colors.white, borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '70%', paddingTop: 8, paddingBottom: 0, shadowColor: '#000', shadowOffset: { width: 0, height: -4 }, shadowOpacity: 0.12, shadowRadius: 20, elevation: 20 },
+  stopModalHeader:       { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: Colors.separator },
+  stopModalTitle:        { fontSize: 16, fontWeight: '700', color: Colors.black },
+  stopModalClose:        { padding: 4 },
+  dropdownItem:          { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 14, paddingHorizontal: 12, borderRadius: 12, marginVertical: 2 },
   dropdownItemSelected:  { backgroundColor: 'rgba(162, 215, 195, 0.2)' },
   ddIcon:                { width: 34, height: 34, borderRadius: 10, backgroundColor: 'rgba(162, 215, 195, 0.25)', justifyContent: 'center', alignItems: 'center' },
   ddIconSelected:        { backgroundColor: Colors.mint },
@@ -328,4 +382,27 @@ const S = StyleSheet.create({
   continueBtn:           { height: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: Colors.mint, borderRadius: 16, marginTop: 8 },
   continueBtnDisabled:   { opacity: 0.45 },
   continueBtnText:       { fontSize: 16, fontWeight: '700', color: Colors.black },
+
+  // Modal styles
+  modalOverlay:          { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', paddingHorizontal: 20 },
+  modalCard:             { width: '100%', backgroundColor: Colors.white, borderRadius: 24, paddingHorizontal: 24, paddingTop: 28, paddingBottom: 28, shadowColor: '#000', shadowOffset: { width: 0, height: 12 }, shadowOpacity: 0.2, shadowRadius: 30, elevation: 20, alignItems: 'center', position: 'relative' },
+  modalCloseBtn:         { position: 'absolute', top: 16, right: 16, padding: 6, borderRadius: 16, backgroundColor: Colors.bgGray },
+  iconWrap:              { width: 56, height: 56, borderRadius: 18, backgroundColor: Colors.mintLighter, justifyContent: 'center', alignItems: 'center', marginBottom: 16 },
+  emailHighlight:        { color: Colors.black, fontWeight: '700' },
+  otpRow:                { flexDirection: 'row', gap: 8, marginBottom: 16, marginTop: 8 },
+  otpBox:                { width: 40, height: 50, borderWidth: 2, borderColor: Colors.border, borderRadius: 12, fontSize: 20, fontWeight: '700', color: Colors.black, backgroundColor: Colors.mint50 },
+  otpBoxFilled:          { borderColor: Colors.mint, backgroundColor: Colors.white },
+  otpBoxError:           { borderColor: Colors.danger, backgroundColor: '#fff5f5' },
+  otpBoxSuccess:         { borderColor: Colors.mintDark, backgroundColor: Colors.mintLighter },
+  errorRow:              { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 12 },
+  errorText:             { fontSize: 13, color: Colors.danger, fontWeight: '500' },
+  successBadge:          { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: Colors.mintLighter, paddingHorizontal: 16, paddingVertical: 10, borderRadius: 12, marginBottom: 12 },
+  successText:           { fontSize: 14, color: Colors.mintText, fontWeight: '600' },
+  verifyBtn:             { width: '100%', height: 50, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: Colors.mint, borderRadius: 14, marginTop: 8 },
+  verifyBtnDisabled:     { opacity: 0.45 },
+  verifyBtnText:         { fontSize: 16, fontWeight: '700', color: Colors.black },
+  resendRow:             { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginTop: 18 },
+  resendLabel:           { fontSize: 13, color: Colors.medGray },
+  resendAction:          { fontSize: 13, color: Colors.mintDark, fontWeight: '700' },
+  resendActionDisabled:  { color: Colors.lightGray },
 });

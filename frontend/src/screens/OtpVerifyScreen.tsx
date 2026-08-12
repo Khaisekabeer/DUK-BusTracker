@@ -20,8 +20,10 @@ import Ionicons from '@react-native-vector-icons/ionicons';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Colors from '../theme/colors';
 import TopBar from '../components/TopBar';
+import { ActivityIndicator } from 'react-native';
+import { authApi } from '../services/api';
+import { saveToken, saveUser } from '../services/storage';
 
-const DUMMY_CODE = '123456';
 const CODE_LENGTH = 6;
 
 export default function OtpVerifyScreen({ navigation, route }: any) {
@@ -31,6 +33,7 @@ export default function OtpVerifyScreen({ navigation, route }: any) {
   const [error, setError] = useState('');
   const [resendTimer, setResendTimer] = useState(30);
   const [verified, setVerified] = useState(false);
+  const [loading, setLoading] = useState(false);
 
   const inputRefs = useRef<(TextInput | null)[]>(Array(CODE_LENGTH).fill(null));
   const shakeAnim = useRef(new Animated.Value(0)).current;
@@ -87,9 +90,18 @@ export default function OtpVerifyScreen({ navigation, route }: any) {
   const enteredCode = otp.join('');
   const isComplete = enteredCode.length === CODE_LENGTH && otp.every(d => d !== '');
 
-  const handleVerify = () => {
+  const handleVerify = async () => {
     if (!isComplete) return;
-    if (enteredCode === DUMMY_CODE) {
+    setLoading(true);
+    setError('');
+    
+    try {
+      const response = await authApi.verifyOtp(email, enteredCode);
+      const { access_token, user } = response.data;
+      
+      await saveToken(access_token);
+      await saveUser(user);
+      
       setVerified(true);
       Animated.spring(successScale, {
         toValue: 1,
@@ -103,20 +115,28 @@ export default function OtpVerifyScreen({ navigation, route }: any) {
           routes: [{ name: 'RouteView', params: { name, boardingPoint } }],
         });
       }, 1200);
-    } else {
-      setError('Incorrect code. Please try again.');
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Incorrect code. Please try again.');
       shake();
       setOtp(Array(CODE_LENGTH).fill(''));
       setTimeout(() => inputRefs.current[0]?.focus(), 50);
+    } finally {
+      setLoading(false);
     }
   };
 
-  const handleResend = () => {
+  const handleResend = async () => {
     if (resendTimer > 0) return;
     setResendTimer(30);
     setOtp(Array(CODE_LENGTH).fill(''));
     setError('');
     setTimeout(() => inputRefs.current[0]?.focus(), 50);
+    
+    try {
+      await authApi.register(name, email, boardingPoint?.id);
+    } catch (err) {
+      console.error('Resend failed', err);
+    }
   };
 
   // Mask email: show first 3 chars + *** + domain
@@ -149,15 +169,6 @@ export default function OtpVerifyScreen({ navigation, route }: any) {
               We sent a 6-digit code to{'\n'}
               <Text style={S.emailHighlight}>{maskedEmail}</Text>
             </Text>
-
-            {/* Testing hint */}
-            <View style={S.hintBox}>
-              <Ionicons name="information-circle-outline" size={14} color={Colors.mintDark} />
-              <Text style={S.hintText}>
-                Testing mode — use code{' '}
-                <Text style={S.hintCode}>123456</Text>
-              </Text>
-            </View>
 
             {/* OTP Boxes */}
             <Animated.View style={[S.otpRow, { transform: [{ translateX: shakeAnim }] }]}>
@@ -200,13 +211,19 @@ export default function OtpVerifyScreen({ navigation, route }: any) {
 
             {/* Verify button */}
             <TouchableOpacity
-              style={[S.verifyBtn, (!isComplete || verified) && S.verifyBtnDisabled]}
+              style={[S.verifyBtn, (!isComplete || verified || loading) && S.verifyBtnDisabled]}
               onPress={handleVerify}
-              disabled={!isComplete || verified}
+              disabled={!isComplete || verified || loading}
               activeOpacity={0.75}
             >
-              <Text style={S.verifyBtnText}>Verify Code</Text>
-              <Ionicons name="arrow-forward" size={18} color={Colors.black} />
+              {loading ? (
+                <ActivityIndicator size="small" color={Colors.black} />
+              ) : (
+                <>
+                  <Text style={S.verifyBtnText}>Verify Code</Text>
+                  <Ionicons name="arrow-forward" size={18} color={Colors.black} />
+                </>
+              )}
             </TouchableOpacity>
 
             {/* Resend */}

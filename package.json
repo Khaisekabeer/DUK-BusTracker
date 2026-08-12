@@ -4,10 +4,14 @@
   "private": true,
   "description": "DUK BusTracker repository containing backend API and frontend mobile app",
   "scripts": {
-    "start:backend": "npm --prefix backend start",
-    "dev:backend": "npm --prefix backend dev",
-    "start:frontend": "npm --prefix frontend start",
-    "android": "npm --prefix frontend android",
-    "ios": "npm --prefix frontend ios"
+    "start:backend": "cd backend && uvicorn main:app --host 0.0.0.0 --port 5004 --reload",
+    "start:frontend": "cd frontend && npx react-native start",
+    "android": "adb reverse tcp:5004 tcp:5004 && cd frontend && npx react-native run-android --no-packager",
+    "ios": "cd frontend && npx react-native run-ios",
+    "dev": "npx concurrently \"npm run start:backend\" \"npm run start:frontend\" \"npm run android\"",
+    "dev:ios": "npx concurrently \"npm run start:backend\" \"npm run start:frontend\" \"npm run ios\""
+  },
+  "dependencies": {
+    "@maplibre/maplibre-react-native": "^11.3.6"
   }
 }

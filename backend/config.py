@@ -32,7 +32,7 @@ class Settings(BaseSettings):
 
 
     # ── Allowed email domain ──────────────────────────────────────────────────
-    ALLOWED_EMAIL_DOMAIN: str = "duk.ac.in"
+    ALLOWED_EMAIL_DOMAIN: str = ["duk.ac.in","iiitmk.ac.in"]
 
     # ── OTP TTL in seconds ────────────────────────────────────────────────────
     OTP_TTL_SECONDS: int = 600  # 10 minutes

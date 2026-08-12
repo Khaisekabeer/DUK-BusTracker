@@ -82,32 +82,54 @@ async def process_raw_payload(raw: str, db: AsyncSession, server_now: datetime) 
 
         return {"type": "power", "event": event}
 
-    # ── QGPSLOC parse ─────────────────────────────────────────────────────────
-    match = re.search(r"\+QGPSLOC:\s*([^\r\n]+)", raw)
-    if not match:
-        raise ValueError("QGPSLOC not found in payload")
+    # ── Payload Extraction: JSON, CSV, or QGPSLOC ─────────────────────────────
+    lat, lon, speed_kmh, gps_time = None, None, None, None
 
-    parts = match.group(1).strip().split(",")
-    if len(parts) < 10:
-        raise ValueError("Incomplete GPS data")
+    # Option A: JSON Format {"lat": 8.535, "lon": 76.990, "speed": 45, "event": ...}
+    if raw.startswith("{") and raw.endswith("}"):
+        import json
+        data = json.loads(raw)
+        lat = float(data.get("lat"))
+        lon = float(data.get("lon"))
+        speed_kmh = float(data.get("speed", 0.0))
+        gps_time = server_now
 
-    time_raw  = parts[0]
-    lat       = float(parts[1])
-    lon       = float(parts[2])
-    speed_raw = float(parts[7]) if len(parts) > 7 else None
-    date_raw  = parts[9]
+    # Option B: CSV Format "lat,lon,speed,event" (e.g. "8.53500,76.99080,45.0,POWER_ON")
+    elif "," in raw and not raw.startswith("+QGPSLOC"):
+        parts = [p.strip() for p in raw.split(",")]
+        if len(parts) >= 2:
+            lat = float(parts[0])
+            lon = float(parts[1])
+            speed_kmh = float(parts[2]) if len(parts) > 2 and parts[2] != "" else 0.0
+            gps_time = server_now
+
+    # Option C: Standard Quectel +QGPSLOC response
+    else:
+        match = re.search(r"\+QGPSLOC:\s*([^\r\n]+)", raw)
+        if not match:
+            raise ValueError("Invalid GPS payload format")
+
+        parts = match.group(1).strip().split(",")
+        if len(parts) < 10:
+            raise ValueError("Incomplete QGPSLOC data")
+
+        time_raw  = parts[0]
+        lat       = float(parts[1])
+        lon       = float(parts[2])
+        speed_raw = float(parts[7]) if len(parts) > 7 else None
+        date_raw  = parts[9]
+
+        speed_kmh    = round(speed_raw * 1.852, 2) if speed_raw is not None else None
+        gps_time_str = (
+            f"20{date_raw[4:6]}-{date_raw[2:4]}-{date_raw[0:2]}"
+            f"T{time_raw[0:2]}:{time_raw[2:4]}:{time_raw[4:6]}+00:00"
+        )
+        gps_time = datetime.fromisoformat(gps_time_str)
 
     if not (8.0 <= lat <= 9.0):
         raise ValueError(f"Invalid latitude: {lat}")
     if not (76.0 <= lon <= 77.5):
         raise ValueError(f"Invalid longitude: {lon}")
-
-    speed_kmh    = round(speed_raw * 1.852, 2) if speed_raw is not None else None
-    gps_time_str = (
-        f"20{date_raw[4:6]}-{date_raw[2:4]}-{date_raw[0:2]}"
-        f"T{time_raw[0:2]}:{time_raw[2:4]}:{time_raw[4:6]}+00:00"
-    )
-    gps_time = datetime.fromisoformat(gps_time_str)
 
     log = GpsLog(server_time=server_now, gps_time=gps_time, lat=lat, lon=lon, speed=speed_kmh)
     db.add(log)
@@ -181,6 +203,8 @@ async def device_websocket(
             try:
                 result = await process_raw_payload(raw, db, server_now)
                 logger.debug("[WS-DEVICE] Processed: %s", result)
+                # Send fast ACK back to hardware
+                await websocket.send_text("ACK")
             except ValueError as exc:
                 logger.warning("[WS-DEVICE] Parse error: %s  raw=%r", exc, raw[:80])
             except Exception:

@@ -63,17 +63,17 @@ def get_start(direction: str) -> tuple[float, float]:
 async def get_active_trip(db: AsyncSession, now_ist: datetime):
     """
     Return today's trip that is eligible for GPS-driven transitions based on the time.
-    Morning (forward)  eligible from 06:00 IST.
-    Evening (reverse)  eligible from 17:00 IST.
+    Morning (forward) and Evening (reverse) windows are matched to constants.
     """
     # Uses Trip
+    from constants import MORNING_WAIT_START, MORNING_END_MINS, EVENING_WAIT_START, EVENING_END_MINS
 
     today = date.today()
-    hour  = now_ist.hour
+    time_mins = now_ist.hour * 60 + now_ist.minute
 
-    if 6 <= hour < 11:
+    if MORNING_WAIT_START <= time_mins < MORNING_END_MINS:
         direction = 'forward'
-    elif hour >= 17:
+    elif EVENING_WAIT_START <= time_mins < EVENING_END_MINS:
         direction = 'reverse'
     else:
         return None
