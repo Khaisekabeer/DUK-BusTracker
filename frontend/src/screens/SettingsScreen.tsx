@@ -24,7 +24,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Ionicons from '@react-native-vector-icons/ionicons';
 import Colors from '../theme/colors';
-import { getUser, saveUser, clearAll, getToken } from '../services/storage';
+import { getUser, saveUser, clearSession, getToken } from '../services/storage';
 import { authApi, trackingApi } from '../services/api';
 import TopBar from '../components/TopBar';
 
@@ -209,7 +209,7 @@ export default function SettingsScreen({ navigation }: any) {
           text: 'Log Out',
           style: 'destructive',
           onPress: async () => {
-            await clearAll();
+            await clearSession();
             navigation.reset({ index: 0, routes: [{ name: 'ProfileSetup' }] });
           },
         },

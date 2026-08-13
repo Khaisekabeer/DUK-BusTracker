@@ -28,7 +28,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { createNavigationContainerRef } from '@react-navigation/native';
 import Colors from '../theme/colors';
 import { getUser } from '../services/storage';
-import { trackingApi } from '../services/api';
+import { suggestionApi } from '../services/api';
 import AboutModal from './AboutModal';
 
 export const navigationRef = createNavigationContainerRef<any>();
@@ -50,7 +50,7 @@ function SuggestionsModal({ visible, onClose }: { visible: boolean; onClose: () 
     if (!text.trim() || sending) return;
     setSending(true);
     try {
-      await trackingApi.submitSuggestion(text.trim());
+      await suggestionApi.submit(text.trim());
       setSent(true);
       setTimeout(() => { setSent(false); setText(''); onClose(); }, 1500);
     } catch {

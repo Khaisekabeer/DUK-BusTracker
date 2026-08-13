@@ -1,3 +1,4 @@
+// @ts-ignore
 import messaging from '@react-native-firebase/messaging';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import api from './api';
@@ -46,7 +47,7 @@ export async function registerForPushNotificationsAsync() {
  * Called when the app is open and a push arrives.
  */
 export function registerForegroundHandler() {
-  return messaging().onMessage(async (remoteMessage) => {
+  return messaging().onMessage(async (remoteMessage: any) => {
     // For now, simply log it. If you want a custom in-app notification UI,
     // dispatch it to a Context or Redux store here.
     console.log('[FCM] Foreground notification received:', remoteMessage);

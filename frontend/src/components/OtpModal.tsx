@@ -105,7 +105,7 @@ export default function OtpModal({
     setOtpError('');
 
     try {
-      const response = await authApi.verifyOtp(email, enteredCode);
+      const response = await authApi.verify(email, enteredCode);
       const { access_token, user } = response.data;
 
       await saveToken(access_token);

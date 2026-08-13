@@ -57,6 +57,8 @@ export const authApi = {
     proximity_alert_value?: number;
     proximity_alert_for?: string;
     notifications_on?: boolean;
+    boarding_alert_stop_id?: number | null;
+    destination_alert_stop_id?: number | null;
   }) => api.patch('/auth/preferences', prefs),
 
   updateDeviceToken: (deviceToken: string, notificationsOn: boolean = true) =>

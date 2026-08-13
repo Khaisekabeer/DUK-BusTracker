@@ -32,7 +32,7 @@ export default function MapFullScreen({ navigation }: any) {
   const fetchData = useCallback(async () => {
     try {
       const [gpsRes, stopsRes] = await Promise.all([
-        trackingApi.getLatestGps(),
+        trackingApi.getLatest(),
         trackingApi.getStops(),
       ]);
       if (gpsRes.data) setBusPosition(gpsRes.data);
