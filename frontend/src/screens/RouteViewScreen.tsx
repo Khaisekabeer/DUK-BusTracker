@@ -649,7 +649,7 @@ export default function RouteViewScreen({ route, navigation }: any) {
           </View>
         </TouchableOpacity>
 
-        <View style={{ height: 40 }} />
+        <View style={{ height: 80 }} />
       </ScrollView>
     </SafeAreaView>
   );
@@ -731,7 +731,7 @@ const S = StyleSheet.create({
   lastUpdatedText: { fontSize: 12, color: Colors.medGray, fontWeight: '600' },
 
   // Map card
-  mapCard:         { height: 220, marginHorizontal: 16, borderRadius: 12, overflow: 'hidden', backgroundColor: Colors.bgGray, position: 'relative', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 16, elevation: 6 },
+  mapCard:         { height: 280, marginHorizontal: 16, marginBottom: 20, borderRadius: 12, overflow: 'hidden', backgroundColor: Colors.bgGray, position: 'relative', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 16, elevation: 6 },
   miniMap:         { flex: 1 },
   miniStopDot:     { width: 8, height: 8, borderRadius: 4, backgroundColor: '#2563eb', borderWidth: 1.5, borderColor: Colors.white },
   
