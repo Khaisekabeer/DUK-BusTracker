@@ -18,7 +18,6 @@ import {
   ActivityIndicator,
   RefreshControl,
   TouchableOpacity,
-  Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Ionicons from '@react-native-vector-icons/ionicons';
@@ -31,6 +30,7 @@ import {
 } from '@maplibre/maplibre-react-native';
 import Colors from '../theme/colors';
 import TopBar from '../components/TopBar';
+import BusIdleAnimation from '../components/BusIdleAnimation';
 import { trackingApi } from '../services/api';
 import { getUser } from '../services/storage';
 
@@ -38,21 +38,77 @@ const MAP_STYLE    = 'https://tiles.openfreemap.org/styles/liberty';
 // Geographic center of Thiruvananthapuram city — used as fallback before any data loads
 const DEFAULT_CENTER: [number, number] = [76.9366, 8.5241];
 const DEFAULT_ZOOM   = 12;
-const POLL_MS        = 2500;
+const POLL_MS        = 30_000;
 // Height per timeline row × 6 visible rows + card padding
 const TIMELINE_VISIBLE_HEIGHT = 56 * 6 + 40;
 
 function todayStr() { return new Date().toISOString().split('T')[0]; }
+
+function getHaversineDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371; // Earth's radius in km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
 
 function formatLastUpdated(isoString: string) {
   const d = new Date(isoString);
   return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + ', ' + d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
+// ── Daily Scheduled Timetables ───────────────────────────────────────────────
+const MORNING_SCHEDULE: Record<string, string> = {
+  'Central Polytechnic':          '07:30 AM',
+  'Vattiyoorkavu Jn':             '07:35 AM',
+  'Manjadimoodu':                 '07:38 AM',
+  'Maruthankuzhi':                '07:42 AM',
+  'Sasthamangalam':               '07:47 AM',
+  'Vellayambalam':                '07:52 AM',
+  'Thampanoor':                   '08:00 AM',
+  'Chandrasekharan Nair Stadium': '08:08 AM',
+  'PMG':                          '08:12 AM',
+  'Pattom':                       '08:16 AM',
+  'Kesavadasapuram':              '08:22 AM',
+  'Ulloor':                       '08:27 AM',
+  'Pongumoodu':                   '08:32 AM',
+  'Sreekaryam':                   '08:37 AM',
+  'Chavadimukku':                 '08:42 AM',
+  'Karyavattom':                  '08:48 AM',
+  'IIITMK':                       '08:52 AM',
+  'Technopark Front':             '08:56 AM',
+  'Kazhakuttam':                  '09:02 AM',
+  'Pallipuram':                   '09:12 AM',
+  'Digital University Kerala':    '09:20 AM',
+};
 
-// ── Time Utilities ────────────────────────────────────────────────────────────
-// These are identical to the helpers in pwa-frontend/src/timetable.js.
-// Keep them here so the RN app stays standalone (no shared package yet).
+const EVENING_SCHEDULE: Record<string, string> = {
+  'Digital University Kerala':    '05:40 PM',
+  'Pallipuram':                   '05:48 PM',
+  'Kazhakuttam':                  '05:58 PM',
+  'Technopark Front':             '06:04 PM',
+  'IIITMK':                       '06:08 PM',
+  'Karyavattom':                  '06:12 PM',
+  'Chavadimukku':                 '06:18 PM',
+  'Sreekaryam':                   '06:23 PM',
+  'Pongumoodu':                   '06:28 PM',
+  'Ulloor':                       '06:33 PM',
+  'Kesavadasapuram':              '06:38 PM',
+  'Pattom':                       '06:44 PM',
+  'PMG':                          '06:48 PM',
+  'Chandrasekharan Nair Stadium': '06:52 PM',
+  'Thampanoor':                   '07:00 PM',
+  'Vellayambalam':                '07:08 PM',
+  'Sasthamangalam':               '07:13 PM',
+  'Maruthankuzhi':                '07:18 PM',
+  'Manjadimoodu':                 '07:22 PM',
+  'Vattiyoorkavu Jn':             '07:25 PM',
+  'Central Polytechnic':          '07:30 PM',
+};
 
 function parseTimeToMinutes(timeStr: string): number | null {
   if (!timeStr) return null;
@@ -74,7 +130,6 @@ function formatMinutesToTime(totalMins: number): string {
   if (hours > 12) hours -= 12;
   if (hours === 0) hours = 12;
   const hStr = hours < 10 ? `0${hours}` : `${hours}`;
-
   const mStr = mins < 10 ? `0${mins}` : `${mins}`;
   return `${hStr}:${mStr} ${period}`;
 }
@@ -154,171 +209,35 @@ export default function RouteViewScreen({ route, navigation }: any) {
   const [busPosition,  setBusPosition]  = useState<any>(null);
   const [routeHistory, setRouteHistory] = useState<any>(null);
   const [eta,          setEta]          = useState<any>(null);
-  const [plannedCoords, setPlannedCoords] = useState<[number, number][]>([]);
-  const [trailCoords,   setTrailCoords]   = useState<[number, number][]>([]);
-  const [stops,         setStops]         = useState<any[]>([]);
-  const [loading,       setLoading]       = useState(true);
-  const [refreshing,    setRefreshing]    = useState(false);
-  const [error,         setError]         = useState('');
-
-  const [animatedBusCoord, setAnimatedBusCoord] = useState<[number, number] | null>(null);
-  const [busBearing, setBusBearing] = useState<number>(0);
+  const [trailCoords,  setTrailCoords]  = useState<[number, number][]>([]);
+  const [stops,        setStops]        = useState<any[]>([]);
+  const [loading,      setLoading]      = useState(true);
+  const [refreshing,   setRefreshing]   = useState(false);
+  const [error,        setError]        = useState('');
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const animIntervalRef = useRef<any>(null);
-  const currentPosRef = useRef<[number, number] | null>(null);
   const cameraRef   = useRef<any>(null);
 
-  function calculateBearing(lon1: number, lat1: number, lon2: number, lat2: number): number {
-    const dLon = ((lon2 - lon1) * Math.PI) / 180;
-    const y = Math.sin(dLon) * Math.cos((lat2 * Math.PI) / 180);
-    const x =
-      Math.cos((lat1 * Math.PI) / 180) * Math.sin((lat2 * Math.PI) / 180) -
-      Math.sin((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.cos(dLon);
-    const brng = (Math.atan2(y, x) * 180) / Math.PI;
-    return (brng + 360) % 360;
-  }
-
-  function haversineDistKm(lon1: number, lat1: number, lon2: number, lat2: number) {
-    const R = 6371;
-    const dLat = ((lat2 - lat1) * Math.PI) / 180;
-    const dLon = ((lon2 - lon1) * Math.PI) / 180;
-    const a = Math.sin(dLat / 2) ** 2 + Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  }
-
-  const animateBusTo = async (targetLat: number, targetLon: number) => {
-    const startPos = currentPosRef.current || [targetLon, targetLat];
-    const [startLon, startLat] = startPos;
-
-    const distKm = haversineDistKm(startLon, startLat, targetLon, targetLat);
-    if (!currentPosRef.current || distKm > 8.0) {
-      setAnimatedBusCoord([targetLon, targetLat]);
-      currentPosRef.current = [targetLon, targetLat];
-      return;
-    }
-
-    if (distKm < 0.0005) {
-      setAnimatedBusCoord([targetLon, targetLat]);
-      currentPosRef.current = [targetLon, targetLat];
-      return;
-    }
-
-    let polyline = [[startLon, startLat], [targetLon, targetLat]];
-    try {
-      const seg = await trackingApi.getRouteSegment(startLat, startLon, targetLat, targetLon);
-      if (seg?.data?.coordinates?.length >= 2) {
-        polyline = seg.data.coordinates;
-      }
-    } catch (_) {}
-
-    const cumDists = [0];
-    for (let i = 1; i < polyline.length; i++) {
-      const d = haversineDistKm(polyline[i-1][0], polyline[i-1][1], polyline[i][0], polyline[i][1]);
-      cumDists.push(cumDists[i-1] + d);
-    }
-    const totalDist = cumDists[cumDists.length - 1];
-
-    if (totalDist <= 0.00001) {
-      setAnimatedBusCoord([targetLon, targetLat]);
-      currentPosRef.current = [targetLon, targetLat];
-      return;
-    }
-
-    if (animIntervalRef.current) clearInterval(animIntervalRef.current);
-    
-    const animDurationMs = 2500;
-    const startTime = Date.now();
-    const fps = 25; // 25 updates per second
-
-    if (cameraRef.current?.easeTo) {
-      cameraRef.current.easeTo({
-        center: [targetLon, targetLat],
-        duration: animDurationMs,
-      });
-    }
-
-    animIntervalRef.current = setInterval(() => {
-      const elapsed = Date.now() - startTime;
-      const progress = Math.min(1.0, elapsed / animDurationMs);
-      
-      const currentDist = progress * totalDist;
-      let segIdx = 0;
-      while (segIdx < cumDists.length - 2 && cumDists[segIdx + 1] < currentDist) {
-        segIdx++;
-      }
-
-      const p1 = polyline[segIdx];
-      const p2 = polyline[segIdx + 1];
-      const segSpan = (cumDists[segIdx + 1] - cumDists[segIdx]) || 0.00001;
-      const segFrac = Math.max(0, Math.min(1, (currentDist - cumDists[segIdx]) / segSpan));
-
-      const curLon = p1[0] + (p2[0] - p1[0]) * segFrac;
-      const curLat = p1[1] + (p2[1] - p1[1]) * segFrac;
-
-      currentPosRef.current = [curLon, curLat];
-      setAnimatedBusCoord([curLon, curLat]);
-      setBusBearing(0); // Disabled rotation per user request
-
-      if (progress >= 1.0) {
-        clearInterval(animIntervalRef.current);
-        animIntervalRef.current = null;
-        const finalPoint = polyline[polyline.length - 1] as [number, number];
-        currentPosRef.current = finalPoint;
-        setAnimatedBusCoord(finalPoint);
-      }
-    }, 1000 / fps);
-  };
-
-  useEffect(() => { getUser().then(u => { if (u) setUser(u); }); }, []);
+  useEffect(() => { getUser().then((u: any) => { if (u) setUser(u); }); }, []);
 
   const fetchData = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true);
     setError('');
     try {
-      const [tripRes, busRes, historyRes, stopsRes, geomRes] = await Promise.all([
+      const [tripRes, busRes, historyRes, stopsRes, trailRes] = await Promise.all([
         trackingApi.getTripState(),
         trackingApi.getLatest().catch(() => null),
         trackingApi.getRouteHistory().catch(() => null),
         trackingApi.getStops().catch(() => null),
-        trackingApi.getRouteGeometry().catch(() => null),
+        trackingApi.getHistoryForDate(todayStr()).catch(() => null),
       ]);
       setTripState(tripRes.data);
-
-      const tripData = tripRes.data;
-      const isSched = Boolean(
-        (tripData?.trip === 'morning' || tripData?.trip === 'evening' || tripData?.trip_id != null) &&
-        tripData?.trip !== 'unscheduled' &&
-        tripData?.trip !== 'idle' &&
-        tripData?.trip !== 'offline' &&
-        tripData?.status !== 'completed'
-      );
-
-      if (busRes) {
-        setBusPosition(busRes.data);
-        const targetLon = Number(busRes.data.lon);
-        const targetLat = Number(busRes.data.lat);
-        if (targetLon && targetLat) {
-          animateBusTo(targetLat, targetLon);
-        }
-      }
+      if (busRes)     setBusPosition(busRes.data);
       if (historyRes) setRouteHistory(historyRes.data);
       if (stopsRes)   setStops(stopsRes.data ?? []);
-      if (geomRes?.data?.coordinates?.length) {
-        setPlannedCoords(geomRes.data.coordinates);
+      if (trailRes?.data?.length) {
+        setTrailCoords(trailRes.data.map((p: any) => [p.lon, p.lat]));
       }
-
-      if (isSched && tripData?.trip_id) {
-        try {
-          const traceRes = await trackingApi.getTripTrace(tripData.trip_id);
-          if (traceRes?.data?.length) {
-            setTrailCoords(traceRes.data);
-          }
-        } catch (_) {}
-      } else if (!isSched) {
-        setTrailCoords([]);
-      }
-
       const stopId = user?.boarding_stop_id ?? boardingPoint?.id;
       if (stopId) {
         const etaRes = await trackingApi.getEta(stopId).catch(() => null);
@@ -347,19 +266,39 @@ export default function RouteViewScreen({ route, navigation }: any) {
 
   // Derived values
   const isLive    = busPosition?.is_live === true;
-  const rawTrip   = tripState?.trip ?? '—';
-  const tripName  = rawTrip.toLowerCase() === 'forward' ? 'Morning' : (rawTrip.toLowerCase() === 'reverse' ? 'Evening' : (rawTrip.charAt(0).toUpperCase() + rawTrip.slice(1)));
+  const tripName  = tripState?.trip ?? '';
   const status    = tripState?.status ?? 'loading';
   const isOnline  = status !== 'offline' && status !== 'loading';
-
-  const isScheduled = Boolean(
-    (tripName.toLowerCase() === 'morning' || tripName.toLowerCase() === 'evening' || tripName.toLowerCase() === 'forward' || tripName.toLowerCase() === 'reverse' || tripState?.trip_id != null) &&
-    tripName.toLowerCase() !== 'unscheduled' &&
-    tripName.toLowerCase() !== 'idle' &&
-    tripName.toLowerCase() !== 'offline' &&
-    status !== 'completed'
-  );
+  const isActive  = status === 'active';
   const destination = tripState?.destination ?? 'DUK CAMPUS';
+  const nextTripTime = tripState?.next_trip_time ?? null;
+  const lateMins  = tripState?.late_by_minutes ?? 0;
+  const isUnscheduled = tripName.toLowerCase().includes('unscheduled');
+
+  // Mirrors PWA isIdleMode: offline, completed, weekend, idle, unscheduled
+  const isIdleMode = isUnscheduled ||
+    ['offline', 'completed', 'weekend', 'idle', 'loading'].includes(status);
+
+  // Dynamic subtext — mirrors PWA getSubtextStatus()
+  function getSubtextStatus(): string {
+    if (status === 'connecting') return 'Connecting to Bus...';
+    if (tripName.toLowerCase().includes('morning')) {
+      const lateTag = lateMins > 2 ? ` • Delayed by ${lateMins} mins` : '';
+      return `Morning Trip → Digital University Kerala${lateTag}`;
+    }
+    if (tripName.toLowerCase().includes('evening')) {
+      const lateTag = lateMins > 2 ? ` • Delayed by ${lateMins} mins` : '';
+      return `Evening Trip → Central Polytechnic${lateTag}`;
+    }
+    if (isUnscheduled) return 'Unscheduled Trip (Live Tracking)';
+    if (status === 'cancelled') return `Trip Cancelled${
+      tripState?.cancellation_reason ? ` (${tripState.cancellation_reason})` : ''
+    }`;
+    if (status === 'completed') return nextTripTime ? `Trip Completed • Next Trip: ${nextTripTime}` : 'Trip Completed';
+    if (status === 'weekend') return nextTripTime ? `Weekend (No Service) • Next Trip: ${nextTripTime}` : 'Weekend (No Service)';
+    if (status === 'waiting') return nextTripTime ? `Waiting for Service • Next Trip: ${nextTripTime}` : 'Waiting for Service';
+    return nextTripTime ? `Not in Service • Next Trip: ${nextTripTime}` : 'Not in Service';
+  }
 
   const busCoord: [number, number] | null =
     busPosition?.lat ? [busPosition.lon, busPosition.lat] : null;
@@ -380,18 +319,29 @@ export default function RouteViewScreen({ route, navigation }: any) {
   const totalCount  = stops.length;
 
   // Full timeline: all stops with daily scheduled time, live ETA, visit status, and delay calculation
-  const isEvening = tripState?.trip?.toLowerCase().includes('evening') || tripState?.trip === 'reverse' || new Date().getHours() >= 14;
+  const currentHour = new Date().getHours();
+  // Morning trip: visible 6:00 AM - 11:00 AM. Evening trip: visible from 4:40 PM (starts 5:40 PM).
+  const isEvening = tripState?.trip?.toLowerCase().includes('evening') || tripState?.trip === 'reverse' || currentHour >= 12;
   const globalDelay = tripState?.late_by_minutes ?? 0;
 
-  const timeline = stops.map((stop: any) => {
+  const displayStops = isEvening ? [...stops].reverse() : stops;
+
+  const timeline = displayStops.map((stop: any, idx: number) => {
     const isVisited = visitedNames.has(stop.name);
     const isCurrent = stop.name === currentStopName;
     const actualArrival = visitedMap[stop.name] ?? null;
-    // Scheduled time comes directly from the DB via the API — no hardcoded dict needed.
-    // Fallback to a generic time only if the admin hasn't set one yet.
-    const scheduledDaily = isEvening
-      ? (stop.evening_time ?? '06:00 PM')
-      : (stop.morning_time ?? '08:00 AM');
+    const scheduledDaily = stop.scheduled_time ?? (isEvening ? EVENING_SCHEDULE[stop.name] : MORNING_SCHEDULE[stop.name]) ?? (isEvening ? '06:00 PM' : '08:00 AM');
+
+    let progress = isVisited ? 1.0 : 0.0;
+    // Calculate relative progress to the next stop if this is the current active segment
+    if (isCurrent && idx < displayStops.length - 1 && busPosition?.lat && busPosition?.lon) {
+      const nextStop = displayStops[idx + 1];
+      const dTotal = getHaversineDistanceKm(Number(stop.lat), Number(stop.lon), Number(nextStop.lat), Number(nextStop.lon));
+      const dRemaining = getHaversineDistanceKm(Number(busPosition.lat), Number(busPosition.lon), Number(nextStop.lat), Number(nextStop.lon));
+      if (dTotal > 0.05) {
+        progress = Math.max(0.0, Math.min(1.0, 1.0 - (dRemaining / dTotal)));
+      }
+    }
 
     let liveTime: string | null = null;
     let delayType: 'late' | 'ahead' | 'ontime' | 'none' = 'none';
@@ -437,6 +387,7 @@ export default function RouteViewScreen({ route, navigation }: any) {
       statusSubtext,
       isVisited,
       isCurrent,
+      progress,
     };
   });
 
@@ -471,13 +422,17 @@ export default function RouteViewScreen({ route, navigation }: any) {
         {/* ── Header ───────────────────────────────────────────────────── */}
         <View style={S.headerRow}>
           <Text style={S.screenTitle}>Route View</Text>
-          <View style={[S.liveBadge, !isOnline && S.offlineBadge]}>
-            <View style={[S.liveDot, !isOnline && S.offlineDot]} />
-            <Text style={[S.liveText, !isOnline && S.offlineText]}>
-              {isOnline ? 'LIVE' : 'OFFLINE'}
-            </Text>
-          </View>
         </View>
+
+        {/* ── Status subtext (dynamic, mirrors PWA) ─────────────────────── */}
+        <Text style={[
+          S.tripSubtext,
+          status === 'connecting' && { color: '#d97706' },
+          (tripName.toLowerCase().includes('morning') || tripName.toLowerCase().includes('evening')) && { color: Colors.mintText },
+          status === 'cancelled' && { color: Colors.danger },
+        ]} numberOfLines={2}>
+          {getSubtextStatus()}
+        </Text>
 
         {/* ── Error banner ─────────────────────────────────────────────── */}
         {error ? (
@@ -487,50 +442,58 @@ export default function RouteViewScreen({ route, navigation }: any) {
           </View>
         ) : null}
 
-        {/* ── Trip pill row ────────────────────────────────────────────── */}
-        <View style={S.tripRow}>
-          <View style={[S.tripPill, !isOnline && S.tripPillOffline]}>
-            <Text style={[S.tripPillText, !isOnline && S.tripPillTextOff]}>
-              {isOnline ? tripName : 'Not in Service'}
-            </Text>
+        {/* ── Trip pill row (only when not idle) ───────────────────────── */}
+        {!isIdleMode && isOnline && (
+          <View style={S.tripRow}>
+            <View style={S.tripPill}>
+              <Text style={S.tripPillText}>{tripName || 'Active'}</Text>
+            </View>
+            <Ionicons name="arrow-forward" size={18} color={Colors.darkGray} style={S.tripArrow} />
+            <Text style={S.tripDest} numberOfLines={1}>{destination.toUpperCase()}</Text>
           </View>
-          {isOnline && (
-            <>
-              <Ionicons name="arrow-forward" size={18} color={Colors.darkGray} style={S.tripArrow} />
-              <Text style={S.tripDest} numberOfLines={1}>{destination.toUpperCase()}</Text>
-            </>
-          )}
-        </View>
+        )}
 
-        {/* ── Stats row ────────────────────────────────────────────────── */}
-        <View style={S.statsCard}>
-          <View style={S.statItem}>
-            <Text style={S.statValue}>
-              {etaMinutes != null ? `${etaMinutes} min` : '—'}
-            </Text>
-            <Text style={S.statLabel}>NEXT STOP</Text>
+        {/* ── Stats card — hidden in idle mode ─────────────────────────── */}
+        {!isIdleMode && (
+          <View style={S.statsCard}>
+            <View style={S.statItem}>
+              <Text style={S.statValue}>
+                {etaMinutes != null ? `${etaMinutes} min` : '—'}
+              </Text>
+              <Text style={S.statLabel} numberOfLines={1}>
+                {user?.boarding_stop_id
+                  ? `TO ${stops.find((s: any) => s.id === user.boarding_stop_id)?.name?.toUpperCase() ?? 'SAVED STOP'}`
+                  : 'NEXT STOP'}
+              </Text>
+            </View>
+            <View style={S.statDivider} />
+            <View style={S.statItem}>
+              <Text style={S.statValue}>
+                {busPosition?.speed != null ? `${Math.round(busPosition.speed)} km/h` : '—'}
+              </Text>
+              <Text style={S.statLabel}>SPEED</Text>
+            </View>
+            <View style={S.statDivider} />
+            <View style={S.statItem}>
+              <Text style={S.statValue}>{`${doneCount}/${totalCount}`}</Text>
+              <Text style={S.statLabel}>STOPS</Text>
+            </View>
           </View>
-          <View style={S.statDivider} />
-          <View style={S.statItem}>
-            <Text style={S.statValue}>
-              {busPosition?.speed != null ? `${Math.round(busPosition.speed)} km/h` : '—'}
-            </Text>
-            <Text style={S.statLabel}>SPEED</Text>
-          </View>
-          <View style={S.statDivider} />
-          <View style={S.statItem}>
-            <Text style={S.statValue}>{`${doneCount}/${totalCount}`}</Text>
-            <Text style={S.statLabel}>STOPS</Text>
-          </View>
-        </View>
+        )}
 
-        {/* ── Stop timeline card — 6 rows visible, rest scrollable ────── */}
-        <View style={S.card}>
-          {timeline.length === 0 ? (
+
+        {/* ── Stop timeline card / Idle animation ──────────────────────── */}
+        <View style={[S.card, isIdleMode && S.cardIdle]}>
+          {isIdleMode ? (
+            <BusIdleAnimation
+              nextTripTime={nextTripTime}
+              isUnscheduled={isUnscheduled}
+            />
+          ) : timeline.length === 0 ? (
             <View style={S.emptyState}>
               <Ionicons name="bus-outline" size={28} color={Colors.lightGray} />
               <Text style={S.emptyStateText}>
-                {isOnline ? 'No stop arrivals recorded yet.' : 'Bus is not currently in service.'}
+                {status === 'connecting' ? 'Connecting to Bus GPS…' : 'No stop arrivals recorded yet.'}
               </Text>
             </View>
           ) : (
@@ -575,10 +538,14 @@ export default function RouteViewScreen({ route, navigation }: any) {
                         ]} />
                       )}
                       {!isLast && (
-                        <View style={[
-                          S.trackLine,
-                          item.isVisited && S.trackLineVisited,
-                        ]} />
+                        <View style={S.trackLine}>
+                          {item.progress > 0 && (
+                            <View style={[
+                              S.trackLineActiveOverlay,
+                              { height: `${item.progress * 100}%` }
+                            ]} />
+                          )}
+                        </View>
                       )}
                     </View>
 
@@ -627,83 +594,48 @@ export default function RouteViewScreen({ route, navigation }: any) {
           <Map
             style={S.miniMap}
             mapStyle={MAP_STYLE}
-            attributionPosition={{ bottom: 8, right: 8 }}
           >
             {(() => {
               const { center, zoom } = getMapViewport(stops, busCoord);
               return (
                 <Camera
                   ref={cameraRef}
-                  minZoomLevel={5}
-                  maxZoomLevel={18}
-                  maxBounds={{
-                    ne: [84.50, 19.50],
-                    sw: [73.50, 7.50],
-                  }}
                   initialViewState={{
-                    center,
-                    zoom,
+                    center: DEFAULT_CENTER,
+                    zoom:   DEFAULT_ZOOM,
                   }}
+                  center={center}
+                  zoom={zoom}
+                  duration={0}
                 />
               );
             })()}
-            {isScheduled && plannedCoords.length > 1 && (
-              <GeoJSONSource
-                id="mini-planned"
-                data={{
-                  type: 'Feature' as const,
-                  geometry: { type: 'LineString' as const, coordinates: plannedCoords },
-                  properties: {},
-                }}
-              >
-                <Layer
-                  id="mini-planned-line"
-                  type="line"
-                  paint={{
-                    'line-color': '#94a3b8',
-                    'line-width': 2.5,
-                    'line-opacity': 0.5,
-                  }}
-                  layout={{
-                    'line-cap': 'round',
-                    'line-join': 'round',
-                  }}
-                />
-              </GeoJSONSource>
+            {trailCoords.length > 1 && (
+            <GeoJSONSource id="mini-trail" data={trailGeoJSON}>
+  <Layer
+    id="mini-trail-line"
+    type="line"
+    paint={{
+      "line-color": "#2563eb",
+      "line-width": 3,
+    }}
+    layout={{
+      "line-cap": "round",
+      "line-join": "round",
+    }}
+  />
+</GeoJSONSource>
             )}
-            {isScheduled && trailCoords.length > 1 && (
-              <GeoJSONSource id="mini-trail" data={trailGeoJSON}>
-                <Layer
-                  id="mini-trail-line"
-                  type="line"
-                  paint={{
-                    'line-color': '#2563eb',
-                    'line-width': 3.5,
-                  }}
-                  layout={{
-                    'line-cap': 'round',
-                    'line-join': 'round',
-                  }}
-                />
-              </GeoJSONSource>
-            )}
-            {isScheduled && stops.map((stop: any) => (
+            {stops.map((stop: any) => (
               <Marker key={`ms-${stop.id}`} id={`ms-${stop.id}`} lngLat={[stop.lon, stop.lat]}>
                 <View style={S.miniStopDot} />
               </Marker>
             ))}
-            {(animatedBusCoord || busCoord) && (
-              <Marker id="mini-bus" lngLat={animatedBusCoord || busCoord!} anchor="bottom">
-                <View style={S.busPinContainer}>
-                  <Image
-                    source={
-                      isLive
-                        ? require('../assets/bus_green.png')
-                        : require('../assets/bus_gray.png')
-                    }
-                    style={S.busPinImage}
-                    resizeMode="contain"
-                  />
+            {busCoord && (
+              <Marker id="mini-bus" lngLat={busCoord}>
+                <View style={S.adminMarkerContainer}>
+                  <Ionicons name="location" size={42} color={isLive ? '#16a34a' : '#6b7280'} style={S.adminMarkerPin} />
+                  <Ionicons name="bus" size={14} color="#ffffff" style={S.adminMarkerBus} />
                 </View>
               </Marker>
             )}
@@ -729,14 +661,15 @@ const S = StyleSheet.create({
   loadingText:   { fontSize: 14, color: Colors.medGray },
   scrollContent: { paddingHorizontal: 20, paddingTop: 20, paddingBottom: 10 },
 
-  // Header
-  headerRow:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
-  screenTitle:   { fontSize: 26, fontWeight: '800', color: Colors.black },
-  liveBadge:     { flexDirection: 'row', alignItems: 'center', backgroundColor: Colors.mintLighter, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, gap: 6 },
+  // Header — PWA: .ios-header-row + .ios-screen-title
+  headerRow:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
+  screenTitle:   { fontSize: 20, fontWeight: '700', color: Colors.black },
+  tripSubtext:   { fontSize: 13, fontWeight: '700', color: Colors.medGray, marginBottom: 12, lineHeight: 18 },
+  liveBadge:     { flexDirection: 'row', alignItems: 'center', backgroundColor: '#dcfce7', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, gap: 6 },
   offlineBadge:  { backgroundColor: '#fee2e2' },
-  liveDot:       { width: 8, height: 8, borderRadius: 4, backgroundColor: Colors.mintDeeper },
+  liveDot:       { width: 8, height: 8, borderRadius: 4, backgroundColor: '#15803d' },
   offlineDot:    { backgroundColor: Colors.danger },
-  liveText:      { fontSize: 12, fontWeight: '700', color: Colors.mintText },
+  liveText:      { fontSize: 12, fontWeight: '700', color: '#15803d' },
   offlineText:   { color: Colors.danger },
 
   // Error
@@ -744,7 +677,7 @@ const S = StyleSheet.create({
   errorBannerText: { fontSize: 13, color: Colors.danger, flex: 1 },
 
   // Trip row
-  tripRow:         { flexDirection: 'row', alignItems: 'center', marginBottom: 16, gap: 6 },
+  tripRow:         { flexDirection: 'row', alignItems: 'center', marginBottom: 12, gap: 6 },
   tripPill:        { backgroundColor: Colors.mintLighter, paddingHorizontal: 14, paddingVertical: 6, borderRadius: 20 },
   tripPillOffline: { backgroundColor: '#f3f4f6' },
   tripPillText:    { fontSize: 13, fontWeight: '800', color: Colors.mintText },
@@ -752,38 +685,40 @@ const S = StyleSheet.create({
   tripArrow:       { marginHorizontal: 2 },
   tripDest:        { fontSize: 13, fontWeight: '700', color: Colors.darkGray, flex: 1 },
 
-  // Stats card
-  statsCard:       { backgroundColor: Colors.white, borderRadius: 18, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 18, paddingHorizontal: 20, marginBottom: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.06, shadowRadius: 10, elevation: 3 },
-  statItem:        { flex: 1, alignItems: 'center' },
-  statValue:       { fontSize: 18, fontWeight: '800', color: Colors.black, marginBottom: 4 },
-  statLabel:       { fontSize: 10, fontWeight: '600', color: Colors.lightGray, letterSpacing: 0.5 },
-  statDivider:     { width: 1, height: 32, backgroundColor: Colors.separator },
+  // Stats card — PWA: .ios-stats-card
+  statsCard:       { backgroundColor: Colors.white, borderRadius: 14, flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', paddingVertical: 12, paddingHorizontal: 16, marginBottom: 12, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.06, shadowRadius: 14, elevation: 3 },
+  statItem:        { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 4 },
+  statValue:       { fontSize: 15, fontWeight: '800', color: Colors.black },
+  statLabel:       { fontSize: 9, fontWeight: '600', color: Colors.lightGray, letterSpacing: 0.5, textAlign: 'center' },
+  statDivider:     { width: 1, height: 24, backgroundColor: Colors.separator, marginTop: 4 },
 
-  // Timeline card
-  card:            { backgroundColor: Colors.white, borderRadius: 20, padding: 20, marginBottom: 24, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.05, shadowRadius: 12, elevation: 3 },
-  emptyState:      { alignItems: 'center', paddingVertical: 24, gap: 10 },
-  emptyStateText:  { fontSize: 13, color: Colors.medGray, textAlign: 'center', lineHeight: 20 },
+  // Timeline card — PWA: .ios-timeline-card
+  card:            { backgroundColor: Colors.white, borderRadius: 20, paddingVertical: 16, marginBottom: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.05, shadowRadius: 16, elevation: 3 },
+  cardIdle:        { paddingHorizontal: 16, paddingBottom: 8 },
+  emptyState:      { alignItems: 'center', paddingVertical: 20 },
+  emptyStateText:  { fontSize: 14, color: Colors.medGray, textAlign: 'center' },
 
-  // Timeline rows (Where Is My Train style)
-  timelineRow:        { flexDirection: 'row', minHeight: 52, alignItems: 'center', marginVertical: 3 },
-  timeLeftCol:        { width: 70, alignItems: 'flex-start', justifyContent: 'center' },
-  schedTimeText:      { fontSize: 13, fontWeight: '700', color: '#4b5563', marginBottom: 2 },
-  liveTimeText:       { fontSize: 13, fontWeight: '800', color: '#16a34a' },
+  // Timeline rows — PWA: .ios-timeline-row (height: 54px)
+  timelineRow:        { flexDirection: 'row', height: 54, alignItems: 'stretch', paddingHorizontal: 20 },
+  timeLeftCol:        { width: 62, alignItems: 'flex-start', justifyContent: 'center' },
+  schedTimeText:      { fontSize: 12, fontWeight: '700', color: '#4b5563', marginBottom: 2 },
+  liveTimeText:       { fontSize: 12, fontWeight: '800', color: '#16a34a' },
   timeTextLate:       { color: '#dc2626' },
   timeTextAhead:      { color: '#16a34a' },
-  liveTimeTextMuted:  { fontSize: 13, fontWeight: '600', color: '#d1d5db' },
+  liveTimeTextMuted:  { fontSize: 12, fontWeight: '600', color: '#d1d5db' },
 
   timelineTrackCol:   { width: 32, alignItems: 'center', justifyContent: 'center', position: 'relative', alignSelf: 'stretch' },
   trackDot:           { width: 10, height: 10, borderRadius: 5, backgroundColor: '#9ca3af', zIndex: 2 },
   trackDotVisited:    { backgroundColor: '#2563eb', width: 12, height: 12, borderRadius: 6 },
   trackLine:          { position: 'absolute', top: '50%', bottom: -30, width: 3, backgroundColor: '#e5e7eb', zIndex: 1 },
   trackLineVisited:   { backgroundColor: '#2563eb' },
+  trackLineActiveOverlay: { position: 'absolute', top: 0, left: 0, right: 0, backgroundColor: '#2563eb' },
   busBadgeWrapper:    { width: 28, height: 28, borderRadius: 14, backgroundColor: 'rgba(37, 99, 235, 0.18)', alignItems: 'center', justifyContent: 'center', zIndex: 3 },
   busBadgeCircle:     { width: 22, height: 22, borderRadius: 11, backgroundColor: '#2563eb', alignItems: 'center', justifyContent: 'center', shadowColor: '#2563eb', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.35, shadowRadius: 4, elevation: 4 },
 
   stopInfoCol:        { flex: 1, paddingLeft: 12, justifyContent: 'center' },
-  stopName:           { fontSize: 15, fontWeight: '700', color: '#1f2937', marginBottom: 2 },
-  stopNameCurrent:    { color: '#2563eb', fontWeight: '800', fontSize: 15.5 },
+  stopName:           { fontSize: 14, fontWeight: '700', color: '#1f2937', marginBottom: 2 },
+  stopNameCurrent:    { color: '#2563eb', fontWeight: '800' },
   stopNameVisited:    { color: '#4b5563' },
   stopSubtext:        { fontSize: 11, fontWeight: '600', color: '#9ca3af' },
   stopSubtextCurrent: { color: '#2563eb', fontWeight: '700' },
@@ -795,14 +730,15 @@ const S = StyleSheet.create({
   sectionTitle:    { fontSize: 20, fontWeight: '800', color: Colors.black },
   lastUpdatedText: { fontSize: 12, color: Colors.medGray, fontWeight: '600' },
 
-  // Map thumbnail
-  mapCard:         { height: 180, borderRadius: 20, overflow: 'hidden', marginBottom: 10, position: 'relative', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 16, elevation: 6, backgroundColor: Colors.bgGray },
+  // Map card
+  mapCard:         { height: 220, marginHorizontal: 16, borderRadius: 12, overflow: 'hidden', backgroundColor: Colors.bgGray, position: 'relative', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 16, elevation: 6 },
   miniMap:         { flex: 1 },
   miniStopDot:     { width: 8, height: 8, borderRadius: 4, backgroundColor: '#2563eb', borderWidth: 1.5, borderColor: Colors.white },
   
-  // Bus Pin Marker (bus.svg)
-  busPinContainer: { alignItems: 'center', justifyContent: 'center', width: 34, height: 34, borderRadius: 17, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.25, shadowRadius: 3, elevation: 5 },
-  busPinImage:     { width: 34, height: 34 },
+  // Admin Marker Style
+  adminMarkerContainer: { width: 42, height: 42, alignItems: 'center', justifyContent: 'center', shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.4, shadowRadius: 5, elevation: 6 },
+  adminMarkerPin: { position: 'absolute', top: 0 },
+  adminMarkerBus: { position: 'absolute', top: 7 }, 
 
   mapOverlay:      { ...StyleSheet.absoluteFill, justifyContent: 'flex-end', alignItems: 'center', paddingBottom: 16 },
   tapPill:         { backgroundColor: 'rgba(255,255,255,0.94)', paddingHorizontal: 22, paddingVertical: 10, borderRadius: 24, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.12, shadowRadius: 8, elevation: 4 },

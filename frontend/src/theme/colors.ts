@@ -32,6 +32,7 @@ const Colors = {
   blue:        '#007bff',
   gold:        '#d4af37',
   yellow:      '#fbbc05',
+  orange:      '#ff9500',
 
   // Map
   mapBg:       '#e8eaed',

@@ -14,8 +14,8 @@ import axios from 'axios';
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-// ── Use 10.0.2.2 for Android Emulator, and localhost for iOS Simulator
-const BASE_URL = Platform.OS === 'android' ? 'http://10.0.2.2:5004' : 'http://localhost:5004';
+// ── Use 10.10.18.75 for Physical device Wi-Fi IP
+const BASE_URL = 'http://10.10.18.75:5004';
 
 const api = axios.create({
   baseURL: BASE_URL,
@@ -52,12 +52,18 @@ export const authApi = {
    * Update proximity alert settings (requires JWT).
    */
   updatePreferences: (prefs: {
-    proximity_alert_enabled: boolean;
+    proximity_alert_enabled?: boolean;
     proximity_alert_type?: string;
     proximity_alert_value?: number;
     proximity_alert_for?: string;
     notifications_on?: boolean;
   }) => api.patch('/auth/preferences', prefs),
+
+  updateDeviceToken: (deviceToken: string, notificationsOn: boolean = true) =>
+    api.put('/auth/device-token', { device_token: deviceToken, notifications_on: notificationsOn }),
+
+  getMyNotifications: () => 
+    api.get('/auth/me/notifications'),
 };
 
 // ── Tracking ───────────────────────────────────────────────────────────────
