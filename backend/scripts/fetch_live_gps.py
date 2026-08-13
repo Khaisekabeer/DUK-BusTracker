@@ -5,13 +5,10 @@ import time
 import requests
 
 
+import os
+
 SUPABASE_URL = "https://mtkdzcdzxtfjwpgnpujc.supabase.co"
-SUPABASE_KEY = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-    "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im10a2R6Y2R6eHRmandwZ25wdWpjIiwi"
-    "cm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NDg5NDA5NCwiZXhwIjoyMTAw"
-    "NDcwMDk0fQ.6s-3g9eEmxTP7tYdw22xqC6scLq7f7IC_1YFdv9NAOE"
-)
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "your_supabase_key_here")
 TABLE_NAME = "gps_realtime"
 
 HEADERS = {
