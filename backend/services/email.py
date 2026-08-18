@@ -32,7 +32,7 @@ def send_otp_email(to_email: str, name: str, otp: str) -> bool:
     if not settings.SMTP_USER or not settings.SMTP_PASSWORD:
         logger.warning("[EMAIL] SMTP_USER or SMTP_PASSWORD not set in .env. Skipping email dispatch.")
         # OTP is still logged below for development testing
-        logger.info("[OTP] (Dev fallback) Code for %s: %s", to_email, otp)
+        logger.debug("[OTP] (Dev fallback) Code for %s: %s", to_email, otp)
         return False
 
     ist_now = (datetime.now(timezone.utc) + _IST).strftime("%Y-%m-%d %H:%M:%S")
@@ -101,7 +101,7 @@ def send_otp_email(to_email: str, name: str, otp: str) -> bool:
     msg["To"]      = to_email
 
     # Always log OTP so dev can verify even if email delivery fails
-    logger.info("[OTP] Code for %s: %s", to_email, otp)
+    logger.debug("[OTP] Code for %s: %s", to_email, otp)
 
     # ── IPv6 Docker Fix ────────────────────────────────────────────────────────
     # Railway containers often lack IPv6 routing, but smtp.gmail.com resolves

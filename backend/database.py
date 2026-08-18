@@ -3,7 +3,7 @@ database.py — Async SQLAlchemy engine + session factory.
 """
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.pool import NullPool
+
 from config import get_settings
 
 settings = get_settings()
@@ -11,7 +11,9 @@ settings = get_settings()
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
-    poolclass=NullPool,
+    pool_size=5,
+    max_overflow=10,
+    pool_recycle=1800,
 )
 
 AsyncSessionLocal = async_sessionmaker(

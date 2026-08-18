@@ -6,7 +6,7 @@ import asyncio
 import logging
 from datetime import date, datetime, timedelta, timezone
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Header, Query
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, and_, func, update
@@ -28,6 +28,8 @@ logger   = logging.getLogger(__name__)
 settings = get_settings()
 router   = APIRouter(prefix="/admin/api", tags=["admin"])
 
+from limiter import limiter
+
 
 def require_admin(x_admin_token: Optional[str] = Header(None)):
     # Compare the header value against the token stored in .env
@@ -44,7 +46,8 @@ class LoginRequest(BaseModel):
 
 
 @router.post("/login")
-async def admin_login(req: LoginRequest):
+@limiter.limit("5/minute")
+async def admin_login(req: LoginRequest, request: Request):
     """
     Validates username + password from .env.
     Returns the ADMIN_TOKEN so the React app can use it as X-Admin-Token header.

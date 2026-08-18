@@ -14,8 +14,7 @@ import axios from 'axios';
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-// ── Use 10.10.18.75 for Physical device Wi-Fi IP
-const BASE_URL = 'http://10.10.18.75:5004';
+const BASE_URL = 'https://duk-bustracker-production.up.railway.app';
 
 const api = axios.create({
   baseURL: BASE_URL,

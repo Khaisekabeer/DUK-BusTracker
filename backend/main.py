@@ -35,29 +35,8 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Create tables on startup and start background tasks."""
-    from sqlalchemy import text
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Auto-migrate: OTP auth columns
-        await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_code VARCHAR(10);"))
-        await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMP WITH TIME ZONE;"))
-        # Auto-migrate: Route terminal role flags (admin-configurable origin/destination)
-        await conn.execute(text("ALTER TABLE bus_stops ADD COLUMN IF NOT EXISTS is_morning_origin BOOLEAN DEFAULT FALSE;"))
-        await conn.execute(text("ALTER TABLE bus_stops ADD COLUMN IF NOT EXISTS is_morning_destination BOOLEAN DEFAULT FALSE;"))
-        await conn.execute(text("ALTER TABLE bus_stops ADD COLUMN IF NOT EXISTS is_evening_origin BOOLEAN DEFAULT FALSE;"))
-        await conn.execute(text("ALTER TABLE bus_stops ADD COLUMN IF NOT EXISTS is_evening_destination BOOLEAN DEFAULT FALSE;"))
-        # Auto-migrate: IST time column (Supabase DEFAULT handles new rows; back-fill old rows here)
-        await conn.execute(text("ALTER TABLE gps_realtime ADD COLUMN IF NOT EXISTS ist_time TIMESTAMP WITHOUT TIME ZONE;"))
-        
-        # Fix any incorrectly migrated historical data (the previous manual SQL shifted time backwards by 5.5 hours)
-        # FIX: Only back-fill rows where ist_time is genuinely NULL.
-        # Previously this ran a full-table UPDATE on every startup,
-        # which blocks for minutes on large tables.
-        await conn.execute(text("""
-            UPDATE gps_realtime
-               SET ist_time = created_at AT TIME ZONE 'Asia/Kolkata'
-             WHERE ist_time IS NULL;
-        """))
 
     logger.info("[STARTUP] Database tables ensured.")
 
@@ -87,14 +66,22 @@ async def lifespan(app: FastAPI):
     logger.info("[SHUTDOWN] Engine disposed.")
 
 
+import os
+
 app = FastAPI(
     title="DUK Bus Tracker API",
     version="1.0.0",
     description="Real-time bus tracking for Digital University Kerala",
     lifespan=lifespan,
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
+    docs_url="/api/docs" if os.environ.get("ENV") != "prod" else None,
+    redoc_url="/api/redoc" if os.environ.get("ENV") != "prod" else None,
 )
+
+from slowapi.errors import RateLimitExceeded
+from slowapi import _rate_limit_exceeded_handler
+from limiter import limiter
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -107,11 +94,22 @@ app.add_middleware(
         "http://127.0.0.1:5174",
         "https://legendary-gaufre-1dc00c.netlify.app",
     ],
-    allow_origin_regex=r"https://.*\.(vercel|netlify)\.app",
+    allow_origin_regex=r"https://legendary-gaufre-1dc00c\.netlify\.app",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from starlette.middleware.base import BaseHTTPMiddleware
+
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+app.add_middleware(BaseHTTPMiddleware, dispatch=security_headers_middleware)
 
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -148,14 +146,19 @@ class SuggestionCreate(BaseModel):
 
 
 @app.post("/api/v1/suggestion")
+@limiter.limit("3/minute")
 async def save_suggestion(req: SuggestionCreate, request: Request, db: AsyncSession = Depends(get_db)):
     from services.auth import decode_token
     
     auth_header = request.headers.get("Authorization")
-    user_id = None
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.split(" ")[1]
-        user_id = decode_token(token)
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return JSONResponse({"error": "Authentication required"}, status_code=401)
+        
+    token = auth_header.split(" ")[1]
+    user_id = decode_token(token)
+    if not user_id:
+        return JSONResponse({"error": "Invalid token"}, status_code=401)
+        
     suggestion_text = html_lib.escape(req.suggestion.strip())
     if not suggestion_text:
         return JSONResponse({"error": "Suggestion cannot be empty"}, status_code=400)

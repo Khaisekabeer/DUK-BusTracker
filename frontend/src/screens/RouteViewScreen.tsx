@@ -18,6 +18,8 @@ import {
   ActivityIndicator,
   RefreshControl,
   TouchableOpacity,
+  Animated,
+  Easing,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Ionicons from '@react-native-vector-icons/ionicons';
@@ -217,6 +219,16 @@ export default function RouteViewScreen({ route, navigation }: any) {
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cameraRef   = useRef<any>(null);
+  const pulseAnim   = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 1.35, duration: 800, useNativeDriver: true, easing: Easing.inOut(Easing.quad) }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 800, useNativeDriver: true, easing: Easing.inOut(Easing.quad) })
+      ])
+    ).start();
+  }, [pulseAnim]);
 
   useEffect(() => { getUser().then((u: any) => { if (u) setUser(u); }); }, []);
 
@@ -265,74 +277,66 @@ export default function RouteViewScreen({ route, navigation }: any) {
   }, [fetchData]);
 
   // Derived values
-  const isLive    = busPosition?.is_live === true;
-  const tripName  = tripState?.trip ?? '';
-  const status    = tripState?.status ?? 'loading';
-  const isOnline  = status !== 'offline' && status !== 'loading';
-  const isActive  = status === 'active';
-  const destination = tripState?.destination ?? 'DUK CAMPUS';
-  const nextTripTime = tripState?.next_trip_time ?? null;
-  const lateMins  = tripState?.late_by_minutes ?? 0;
-  const isUnscheduled = tripName.toLowerCase().includes('unscheduled');
+  const status        = tripState?.status || 'offline';
+  const isOnline      = status === 'active' || status === 'connecting';
+  const isIdleMode    = status === 'offline' || status === 'cancelled' || status === 'completed' || status === 'waiting';
+  const tripName      = tripState?.trip || '';
+  const nextTripTime  = tripState?.next_trip_time || null;
+  const lateMins      = tripState?.late_by_minutes || 0;
+  const isUnscheduled = tripState?.is_deviated || false;
+  const isLive        = status === 'active';
 
-  // Mirrors PWA isIdleMode: offline, completed, weekend, idle, unscheduled
-  const isIdleMode = isUnscheduled ||
-    ['offline', 'completed', 'weekend', 'idle', 'loading'].includes(status);
+  // Morning trip: visible 6:00 AM - 11:00 AM. Evening trip: visible from 4:40 PM (starts 5:40 PM).
+  const currentHour   = new Date().getHours();
+  const isEvening     = tripState?.trip?.toLowerCase().includes('evening') || tripState?.trip === 'reverse' || currentHour >= 12;
+  const destination   = isEvening ? 'TRIVANDRUM' : 'DUK CAMPUS';
 
-  // Dynamic subtext — mirrors PWA getSubtextStatus()
   function getSubtextStatus(): string {
-    if (status === 'connecting') return 'Connecting to Bus...';
-    if (tripName.toLowerCase().includes('morning')) {
-      const lateTag = lateMins > 2 ? ` • Delayed by ${lateMins} mins` : '';
-      return `Morning Trip → Digital University Kerala${lateTag}`;
+    if (isIdleMode) {
+      if (status === 'cancelled') return 'Trip cancelled';
+      return nextTripTime ? `Next trip at ${nextTripTime}` : 'Bus is offline';
     }
-    if (tripName.toLowerCase().includes('evening')) {
-      const lateTag = lateMins > 2 ? ` • Delayed by ${lateMins} mins` : '';
-      return `Evening Trip → Central Polytechnic${lateTag}`;
-    }
-    if (isUnscheduled) return 'Unscheduled Trip (Live Tracking)';
-    if (status === 'cancelled') return `Trip Cancelled${
-      tripState?.cancellation_reason ? ` (${tripState.cancellation_reason})` : ''
-    }`;
-    if (status === 'completed') return nextTripTime ? `Trip Completed • Next Trip: ${nextTripTime}` : 'Trip Completed';
-    if (status === 'weekend') return nextTripTime ? `Weekend (No Service) • Next Trip: ${nextTripTime}` : 'Weekend (No Service)';
-    if (status === 'waiting') return nextTripTime ? `Waiting for Service • Next Trip: ${nextTripTime}` : 'Waiting for Service';
-    return nextTripTime ? `Not in Service • Next Trip: ${nextTripTime}` : 'Not in Service';
+    if (status === 'connecting') return 'Connecting to bus...';
+    
+    let sub = `${tripName || 'Active Trip'} → ${destination}`;
+    if (lateMins > 0) sub += ` • Delayed by ${lateMins} mins`;
+    else if (lateMins < 0) sub += ` • Ahead by ${Math.abs(lateMins)} mins`;
+    else sub += ` • On time`;
+    return sub;
   }
 
-  const busCoord: [number, number] | null =
-    busPosition?.lat ? [busPosition.lon, busPosition.lat] : null;
+  const busCoord: [number, number] | null = busPosition?.lat && busPosition?.lon
+    ? [busPosition.lon, busPosition.lat]
+    : null;
 
   const trailGeoJSON = {
     type: 'Feature' as const,
     geometry: { type: 'LineString' as const, coordinates: trailCoords },
-    properties: {},
+    properties: {}
   };
 
-  // Build full stop timeline merging visited times with upcoming stops
-  const visitedMap: Record<string, string> = routeHistory?.arrivalTimes ?? {};
-  const visitedNames = new Set(Object.keys(routeHistory?.visitedStops ?? {}));
-  const currentStopName = [...visitedNames].pop();
+  const visitedMap: Record<string, string> = routeHistory?.arrivalTimes || {};
+  const visitedNames = new Set<string>(Object.keys(routeHistory?.visitedStops || {}));
 
-  const etaMinutes  = eta?.eta_minutes != null ? Math.round(eta.eta_minutes) : null;
-  const doneCount   = visitedNames.size;
-  const totalCount  = stops.length;
-
-  // Full timeline: all stops with daily scheduled time, live ETA, visit status, and delay calculation
-  const currentHour = new Date().getHours();
-  // Morning trip: visible 6:00 AM - 11:00 AM. Evening trip: visible from 4:40 PM (starts 5:40 PM).
-  const isEvening = tripState?.trip?.toLowerCase().includes('evening') || tripState?.trip === 'reverse' || currentHour >= 12;
   const globalDelay = tripState?.late_by_minutes ?? 0;
-
   const displayStops = isEvening ? [...stops].reverse() : stops;
+  
+  // The current stop is the first stop in the display order that has NOT been visited yet
+  const currentStopIndex = displayStops.findIndex((s: any) => !visitedNames.has(s.name));
+  const currentStopName = currentStopIndex !== -1 ? displayStops[currentStopIndex].name : null;
+
+  const etaMinutes  = eta?.eta_minutes ?? null;
+  const doneCount   = visitedNames.size;
+  const totalCount  = stops.length || 21;
 
   const timeline = displayStops.map((stop: any, idx: number) => {
     const isVisited = visitedNames.has(stop.name);
     const isCurrent = stop.name === currentStopName;
+    const isMissed  = !isVisited && currentStopIndex > -1 && idx < currentStopIndex;
     const actualArrival = visitedMap[stop.name] ?? null;
     const scheduledDaily = stop.scheduled_time ?? (isEvening ? EVENING_SCHEDULE[stop.name] : MORNING_SCHEDULE[stop.name]) ?? (isEvening ? '06:00 PM' : '08:00 AM');
 
-    let progress = isVisited ? 1.0 : 0.0;
+    let progress = (isVisited || isMissed) ? 1.0 : 0.0;
     // Calculate relative progress to the next stop if this is the current active segment
     if (isCurrent && idx < displayStops.length - 1 && busPosition?.lat && busPosition?.lon) {
       const nextStop = displayStops[idx + 1];
@@ -354,6 +358,8 @@ export default function RouteViewScreen({ route, navigation }: any) {
       if (delay) {
         delayType = delay.type === 'late' ? 'late' : 'ahead';
       }
+    } else if (isMissed) {
+      statusSubtext = 'Missed';
     } else if (isOnline) {
       // If live trip is active, compute estimated arrival time based on delay
       liveTime = computeEstimatedTime(scheduledDaily, globalDelay);
@@ -387,6 +393,7 @@ export default function RouteViewScreen({ route, navigation }: any) {
       statusSubtext,
       isVisited,
       isCurrent,
+      isMissed,
       progress,
     };
   });
@@ -526,15 +533,16 @@ export default function RouteViewScreen({ route, navigation }: any) {
                     {/* Center: Track line & Dot / Bus Badge */}
                     <View style={S.timelineTrackCol}>
                       {item.isCurrent ? (
-                        <View style={S.busBadgeWrapper}>
+                        <Animated.View style={[S.busBadgeWrapper, { transform: [{ scale: pulseAnim }] }]}>
                           <View style={S.busBadgeCircle}>
                             <Ionicons name="bus" size={13} color="#ffffff" />
                           </View>
-                        </View>
+                        </Animated.View>
                       ) : (
                         <View style={[
                           S.trackDot,
                           item.isVisited && S.trackDotVisited,
+                          item.isMissed && S.trackDotMissed,
                         ]} />
                       )}
                       {!isLast && (
@@ -555,6 +563,7 @@ export default function RouteViewScreen({ route, navigation }: any) {
                         S.stopName,
                         item.isCurrent && S.stopNameCurrent,
                         item.isVisited && S.stopNameVisited,
+                        item.isMissed && S.stopNameMissed,
                       ]} numberOfLines={1}>
                         {item.name}
                       </Text>
@@ -562,8 +571,9 @@ export default function RouteViewScreen({ route, navigation }: any) {
                         <Text style={[
                           S.stopSubtext,
                           item.isCurrent && S.stopSubtextCurrent,
-                          item.delayType === 'late' && !item.isVisited && S.stopSubtextLate,
-                          (item.delayType === 'ahead' || item.delayType === 'ontime') && !item.isVisited && S.stopSubtextAhead,
+                          item.isMissed && S.stopSubtextMissed,
+                          item.delayType === 'late' && !item.isVisited && !item.isMissed && S.stopSubtextLate,
+                          (item.delayType === 'ahead' || item.delayType === 'ontime') && !item.isVisited && !item.isMissed && S.stopSubtextAhead,
                         ]}>
                           {item.statusSubtext}
                         </Text>
@@ -649,7 +659,7 @@ export default function RouteViewScreen({ route, navigation }: any) {
           </View>
         </TouchableOpacity>
 
-        <View style={{ height: 80 }} />
+        <View style={{ height: 40 }} />
       </ScrollView>
     </SafeAreaView>
   );
@@ -662,9 +672,9 @@ const S = StyleSheet.create({
   scrollContent: { paddingHorizontal: 20, paddingTop: 20, paddingBottom: 10 },
 
   // Header — PWA: .ios-header-row + .ios-screen-title
-  headerRow:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
-  screenTitle:   { fontSize: 20, fontWeight: '700', color: Colors.black },
-  tripSubtext:   { fontSize: 13, fontWeight: '700', color: Colors.medGray, marginBottom: 12, lineHeight: 18 },
+  headerRow:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
+  screenTitle:   { fontSize: 24, fontWeight: '800', color: Colors.black, letterSpacing: -0.5 },
+  tripSubtext:   { fontSize: 14, fontWeight: '600', color: Colors.medGray, marginBottom: 12, lineHeight: 18 },
   liveBadge:     { flexDirection: 'row', alignItems: 'center', backgroundColor: '#dcfce7', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, gap: 6 },
   offlineBadge:  { backgroundColor: '#fee2e2' },
   liveDot:       { width: 8, height: 8, borderRadius: 4, backgroundColor: '#15803d' },
@@ -678,25 +688,25 @@ const S = StyleSheet.create({
 
   // Trip row
   tripRow:         { flexDirection: 'row', alignItems: 'center', marginBottom: 12, gap: 6 },
-  tripPill:        { backgroundColor: Colors.mintLighter, paddingHorizontal: 14, paddingVertical: 6, borderRadius: 20 },
+  tripPill:        { backgroundColor: Colors.mintLighter, paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20 },
   tripPillOffline: { backgroundColor: '#f3f4f6' },
-  tripPillText:    { fontSize: 13, fontWeight: '800', color: Colors.mintText },
+  tripPillText:    { fontSize: 14, fontWeight: '800', color: Colors.mintText },
   tripPillTextOff: { color: Colors.medGray },
   tripArrow:       { marginHorizontal: 2 },
-  tripDest:        { fontSize: 13, fontWeight: '700', color: Colors.darkGray, flex: 1 },
+  tripDest:        { fontSize: 14, fontWeight: '700', color: Colors.darkGray, flex: 1 },
 
   // Stats card — PWA: .ios-stats-card
-  statsCard:       { backgroundColor: Colors.white, borderRadius: 14, flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', paddingVertical: 12, paddingHorizontal: 16, marginBottom: 12, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.06, shadowRadius: 14, elevation: 3 },
+  statsCard:       { backgroundColor: Colors.white, borderRadius: 16, flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', paddingVertical: 18, paddingHorizontal: 16, marginBottom: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.05, shadowRadius: 12, elevation: 3 },
   statItem:        { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 4 },
-  statValue:       { fontSize: 15, fontWeight: '800', color: Colors.black },
-  statLabel:       { fontSize: 9, fontWeight: '600', color: Colors.lightGray, letterSpacing: 0.5, textAlign: 'center' },
-  statDivider:     { width: 1, height: 24, backgroundColor: Colors.separator, marginTop: 4 },
+  statValue:       { fontSize: 20, fontWeight: '800', color: Colors.black },
+  statLabel:       { fontSize: 12, fontWeight: '700', color: Colors.lightGray, letterSpacing: 0.5, textAlign: 'center' },
+  statDivider:     { width: 1, height: 32, backgroundColor: Colors.separator, marginTop: 4 },
 
   // Timeline card — PWA: .ios-timeline-card
-  card:            { backgroundColor: Colors.white, borderRadius: 20, paddingVertical: 16, marginBottom: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.05, shadowRadius: 16, elevation: 3 },
-  cardIdle:        { paddingHorizontal: 16, paddingBottom: 8 },
-  emptyState:      { alignItems: 'center', paddingVertical: 20 },
-  emptyStateText:  { fontSize: 14, color: Colors.medGray, textAlign: 'center' },
+  card:            { backgroundColor: Colors.white, borderRadius: 20, paddingVertical: 18, marginBottom: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.05, shadowRadius: 16, elevation: 3 },
+  cardIdle:        { paddingBottom: 8, overflow: 'hidden', shadowOpacity: 0, elevation: 0, backgroundColor: 'transparent' },
+  emptyState:      { alignItems: 'center', paddingVertical: 24 },
+  emptyStateText:  { fontSize: 16, color: Colors.medGray, textAlign: 'center', marginTop: 12 },
 
   // Timeline rows — PWA: .ios-timeline-row (height: 54px)
   timelineRow:        { flexDirection: 'row', height: 54, alignItems: 'stretch', paddingHorizontal: 20 },
@@ -709,29 +719,32 @@ const S = StyleSheet.create({
 
   timelineTrackCol:   { width: 32, alignItems: 'center', justifyContent: 'center', position: 'relative', alignSelf: 'stretch' },
   trackDot:           { width: 10, height: 10, borderRadius: 5, backgroundColor: '#9ca3af', zIndex: 2 },
-  trackDotVisited:    { backgroundColor: '#2563eb', width: 12, height: 12, borderRadius: 6 },
+  trackDotVisited:    { backgroundColor: '#16a34a', width: 12, height: 12, borderRadius: 6 },
+  trackDotMissed:     { backgroundColor: '#dc2626', width: 10, height: 10, borderRadius: 5 },
   trackLine:          { position: 'absolute', top: '50%', bottom: -30, width: 3, backgroundColor: '#e5e7eb', zIndex: 1 },
-  trackLineVisited:   { backgroundColor: '#2563eb' },
-  trackLineActiveOverlay: { position: 'absolute', top: 0, left: 0, right: 0, backgroundColor: '#2563eb' },
-  busBadgeWrapper:    { width: 28, height: 28, borderRadius: 14, backgroundColor: 'rgba(37, 99, 235, 0.18)', alignItems: 'center', justifyContent: 'center', zIndex: 3 },
-  busBadgeCircle:     { width: 22, height: 22, borderRadius: 11, backgroundColor: '#2563eb', alignItems: 'center', justifyContent: 'center', shadowColor: '#2563eb', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.35, shadowRadius: 4, elevation: 4 },
+  trackLineVisited:   { backgroundColor: '#16a34a' },
+  trackLineActiveOverlay: { position: 'absolute', top: 0, left: 0, right: 0, backgroundColor: '#16a34a' },
+  busBadgeWrapper:    { width: 28, height: 28, borderRadius: 14, backgroundColor: 'rgba(22, 163, 74, 0.18)', alignItems: 'center', justifyContent: 'center', zIndex: 3 },
+  busBadgeCircle:     { width: 22, height: 22, borderRadius: 11, backgroundColor: '#16a34a', alignItems: 'center', justifyContent: 'center', shadowColor: '#16a34a', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.35, shadowRadius: 4, elevation: 4 },
 
   stopInfoCol:        { flex: 1, paddingLeft: 12, justifyContent: 'center' },
   stopName:           { fontSize: 14, fontWeight: '700', color: '#1f2937', marginBottom: 2 },
-  stopNameCurrent:    { color: '#2563eb', fontWeight: '800' },
+  stopNameCurrent:    { color: '#16a34a', fontWeight: '800' },
   stopNameVisited:    { color: '#4b5563' },
+  stopNameMissed:     { color: '#dc2626', textDecorationLine: 'line-through' },
   stopSubtext:        { fontSize: 11, fontWeight: '600', color: '#9ca3af' },
-  stopSubtextCurrent: { color: '#2563eb', fontWeight: '700' },
+  stopSubtextCurrent: { color: '#16a34a', fontWeight: '700' },
+  stopSubtextMissed:  { color: '#dc2626', fontWeight: '700' },
   stopSubtextLate:    { color: '#dc2626', fontWeight: '700' },
   stopSubtextAhead:   { color: '#16a34a', fontWeight: '700' },
 
   // Section title
   sectionHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, paddingHorizontal: 4 },
-  sectionTitle:    { fontSize: 20, fontWeight: '800', color: Colors.black },
+  sectionTitle:    { fontSize: 22, fontWeight: '800', color: Colors.black },
   lastUpdatedText: { fontSize: 12, color: Colors.medGray, fontWeight: '600' },
 
   // Map card
-  mapCard:         { height: 280, marginHorizontal: 16, marginBottom: 20, borderRadius: 12, overflow: 'hidden', backgroundColor: Colors.bgGray, position: 'relative', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 16, elevation: 6 },
+  mapCard:         { height: 280, marginBottom: 20, borderRadius: 20, overflow: 'hidden', backgroundColor: Colors.bgGray, position: 'relative', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 16, elevation: 6 },
   miniMap:         { flex: 1 },
   miniStopDot:     { width: 8, height: 8, borderRadius: 4, backgroundColor: '#2563eb', borderWidth: 1.5, borderColor: Colors.white },
   

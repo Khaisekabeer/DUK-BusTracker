@@ -78,6 +78,12 @@ android {
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
 
+    externalNativeBuild {
+        cmake {
+            version "3.28.3"
+        }
+    }
+
     namespace "com.bustracker"
     defaultConfig {
         applicationId "com.bustracker"

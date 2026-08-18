@@ -8,7 +8,7 @@ import uuid
 from uuid import UUID
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -23,6 +23,8 @@ from config import get_settings
 logger    = logging.getLogger(__name__)
 settings  = get_settings()
 router    = APIRouter(prefix="/auth", tags=["auth"])
+
+from limiter import limiter
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -62,7 +64,8 @@ class ProximityPrefsRequest(BaseModel):
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @router.post("/register", status_code=202)
-async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def register(req: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """
     Step 1: User submits name + @duk.ac.in email.
     - If user already exists and is verified, just send a new OTP (re-login).
@@ -102,7 +105,8 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/verify")
-async def verify(req: VerifyRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/minute")
+async def verify(req: VerifyRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """
     Step 2: User submits OTP.
     On success → mark user verified + return JWT.

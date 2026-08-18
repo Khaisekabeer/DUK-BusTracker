@@ -1,6 +1,7 @@
 # Secrets — never commit
 .env
 firebase-service-account.json
+firebase-services.json
 
 # Python cache
 __pycache__/

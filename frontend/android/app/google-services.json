@@ -9,7 +9,7 @@
       "client_info": {
         "mobilesdk_app_id": "1:773406220529:android:78003a7e2fce916c44c950",
         "android_client_info": {
-          "package_name": "DUK_BUS.ANDROID"
+          "package_name": "com.bustracker"
         }
       },
       "oauth_client": [],

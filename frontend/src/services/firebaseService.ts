@@ -35,7 +35,7 @@ export async function registerForPushNotificationsAsync() {
       { device_token: token, notifications_on: true },
       { headers: { Authorization: `Bearer ${jwt}` } }
     );
-    console.log('[FCM] Token registered with backend');
+    console.log('[FCM] Token registered');
 
   } catch (error) {
     console.warn('[FCM] Failed to register token:', error);
