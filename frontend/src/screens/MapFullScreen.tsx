@@ -16,6 +16,7 @@ import {
 import Colors from '../theme/colors';
 import { trackingApi } from '../services/api';
 import { getUser } from '../services/storage';
+import { haversineDistKm } from '../utils/math';
 
 const MAP_STYLE   = 'https://tiles.openfreemap.org/styles/liberty';
 const DEFAULT_CENTER: [number, number] = [76.9366, 8.5241];
@@ -25,33 +26,128 @@ const POLL_MS = 15000;
 export default function MapFullScreen({ navigation }: any) {
   const [busPosition, setBusPosition] = useState<any>(null);
   const [stops, setStops] = useState<any[]>([]);
+  const [plannedCoords, setPlannedCoords] = useState<[number, number][]>([]);
   const [trailCoords, setTrailCoords] = useState<[number, number][]>([]);
+  const [animatedBus, setAnimatedBus] = useState<[number, number] | null>(null);
+
   const cameraRef = useRef<any>(null);
   const intervalRef = useRef<any>(null);
+  const animIntervalRef = useRef<any>(null);
+  const currentPosRef = useRef<[number, number] | null>(null);
+
+  const animateBusTo = useCallback(async (targetLat: number, targetLon: number) => {
+    const startPos = currentPosRef.current || [targetLon, targetLat];
+    const [startLon, startLat] = startPos;
+    const distKm = haversineDistKm(startLon, startLat, targetLon, targetLat);
+
+    if (!currentPosRef.current || distKm > 8.0 || distKm < 0.0005) {
+      setAnimatedBus([targetLon, targetLat]);
+      currentPosRef.current = [targetLon, targetLat];
+      return;
+    }
+
+    let polyline = [[startLon, startLat], [targetLon, targetLat]];
+    try {
+      const seg = await trackingApi.getRouteSegment(startLat, startLon, targetLat, targetLon);
+      if (seg.data?.coordinates?.length > 1) polyline = seg.data.coordinates;
+    } catch (_) { }
+
+    const cumDists = [0];
+    for (let i = 1; i < polyline.length; i++) {
+      cumDists.push(cumDists[i - 1] + haversineDistKm(polyline[i - 1][0], polyline[i - 1][1], polyline[i][0], polyline[i][1]));
+    }
+    const totalDist = cumDists[cumDists.length - 1];
+
+    if (totalDist <= 0.00001) {
+      setAnimatedBus([targetLon, targetLat]);
+      currentPosRef.current = [targetLon, targetLat];
+      return;
+    }
+
+    if (animIntervalRef.current) cancelAnimationFrame(animIntervalRef.current);
+
+    const duration = POLL_MS;
+    const startTime = Date.now();
+
+    const step = () => {
+      let progress = (Date.now() - startTime) / duration;
+      if (progress > 1.0) progress = 1.0;
+
+      const currentDist = progress * totalDist;
+      let segIdx = 0;
+      while (segIdx < cumDists.length - 2 && cumDists[segIdx + 1] < currentDist) {
+        segIdx++;
+      }
+
+      const p1 = polyline[segIdx];
+      const p2 = polyline[segIdx + 1];
+      const segSpan = (cumDists[segIdx + 1] - cumDists[segIdx]) || 0.00001;
+      const segFrac = Math.max(0, Math.min(1, (currentDist - cumDists[segIdx]) / segSpan));
+
+      const curLon = p1[0] + (p2[0] - p1[0]) * segFrac;
+      const curLat = p1[1] + (p2[1] - p1[1]) * segFrac;
+
+      setAnimatedBus([curLon, curLat]);
+      currentPosRef.current = [curLon, curLat];
+
+      if (progress < 1.0) {
+        animIntervalRef.current = requestAnimationFrame(step);
+      } else {
+        const finalPoint = polyline[polyline.length - 1];
+        setAnimatedBus(finalPoint as [number, number]);
+        currentPosRef.current = finalPoint as [number, number];
+      }
+    };
+
+    animIntervalRef.current = requestAnimationFrame(step);
+  }, []);
 
   const fetchData = useCallback(async () => {
     try {
-      const [gpsRes, stopsRes] = await Promise.all([
+      const [gpsRes, stopsRes, histRes, geoRes] = await Promise.allSettled([
         trackingApi.getLatest(),
         trackingApi.getStops(),
+        trackingApi.getRouteHistory(),
+        plannedCoords.length === 0 ? trackingApi.getRouteGeometry() : Promise.resolve(null),
       ]);
-      if (gpsRes.data) setBusPosition(gpsRes.data);
-      if (stopsRes.data?.stops) setStops(stopsRes.data.stops);
+
+      const gps = gpsRes.status === 'fulfilled' ? gpsRes.value?.data : null;
+      if (gps) {
+        setBusPosition(gps);
+        if (gps.lat && gps.lon) animateBusTo(gps.lat, gps.lon);
+      }
+
+      if (stopsRes.status === 'fulfilled' && stopsRes.value?.data?.stops) {
+        setStops(stopsRes.value.data.stops);
+      }
+
+      if (histRes.status === 'fulfilled' && histRes.value?.data?.coords) {
+        setTrailCoords(histRes.value.data.coords.map((c: any) => [c.lon, c.lat]));
+      }
+
+      if (geoRes.status === 'fulfilled' && geoRes.value?.data?.coordinates) {
+        setPlannedCoords(geoRes.value.data.coordinates);
+      }
     } catch { /* ignore */ }
-  }, []);
+  }, [animateBusTo, plannedCoords.length]);
 
   useEffect(() => {
     fetchData();
     intervalRef.current = setInterval(fetchData, POLL_MS);
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (animIntervalRef.current) cancelAnimationFrame(animIntervalRef.current);
+    };
   }, [fetchData]);
 
-  const busCoord: [number, number] | null = busPosition?.lat
-    ? [busPosition.lon, busPosition.lat]
-    : null;
+  const center = animatedBus ?? DEFAULT_CENTER;
+  const zoom   = animatedBus ? 14 : DEFAULT_ZOOM;
 
-  const center = busCoord ?? DEFAULT_CENTER;
-  const zoom   = busCoord ? 14 : DEFAULT_ZOOM;
+  const plannedGeoJSON = {
+    type: 'Feature' as const,
+    geometry: { type: 'LineString' as const, coordinates: plannedCoords },
+    properties: {},
+  };
 
   const trailGeoJSON = {
     type: 'Feature' as const,
@@ -82,6 +178,17 @@ export default function MapFullScreen({ navigation }: any) {
             duration={500}
           />
 
+          {plannedCoords.length > 1 && (
+            <GeoJSONSource id="planned" data={plannedGeoJSON}>
+              <Layer
+                id="planned-line"
+                type="line"
+                paint={{ 'line-color': '#94a3b8', 'line-width': 2.5, 'line-opacity': 0.5 }}
+                layout={{ 'line-cap': 'round', 'line-join': 'round' }}
+              />
+            </GeoJSONSource>
+          )}
+
           {trailCoords.length > 1 && (
             <GeoJSONSource id="trail" data={trailGeoJSON}>
               <Layer
@@ -99,8 +206,8 @@ export default function MapFullScreen({ navigation }: any) {
             </Marker>
           ))}
 
-          {busCoord && (
-            <Marker id="bus" lngLat={busCoord}>
+          {animatedBus && (
+            <Marker id="bus" lngLat={animatedBus}>
               <View style={S.busMarker}>
                 <Ionicons name="location" size={48} color={busPosition?.is_live ? '#16a34a' : '#6b7280'} />
                 <Ionicons name="bus" size={16} color="#fff" style={S.busIcon} />
@@ -110,7 +217,7 @@ export default function MapFullScreen({ navigation }: any) {
         </Map>
 
         {/* Status pill */}
-        {busCoord && (
+        {animatedBus && (
           <View style={S.statusPill}>
             <View style={[S.statusDot, { backgroundColor: busPosition?.is_live ? '#16a34a' : '#9ca3af' }]} />
             <Text style={S.statusText}>

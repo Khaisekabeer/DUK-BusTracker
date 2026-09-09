@@ -14,8 +14,8 @@ import axios from 'axios';
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const BASE_URL = 'https://duk-bustracker-production-e4f6.up.railway.app';
-
+// const BASE_URL = 'https://duk-bustracker-production-e4f6.up.railway.app';
+const BASE_URL = 'http://10.143.83.17:5004';
 const api = axios.create({
   baseURL: BASE_URL,
   timeout: 30000,

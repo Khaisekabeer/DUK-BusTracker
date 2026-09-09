@@ -42,6 +42,36 @@ export async function getUser(): Promise<StoredUser | null> {
   }
 }
 
+// ── Alert Settings ─────────────────────────────────────────────────────────
+
+const ALERT_SETTINGS_KEY = 'alert_settings';
+
+export type AlarmTone = 'default' | 'gentle' | 'urgent' | 'silent';
+
+export interface AlertSettings {
+  vibrateEnabled: boolean;
+  alarmTone: AlarmTone;
+}
+
+const DEFAULT_ALERT_SETTINGS: AlertSettings = {
+  vibrateEnabled: true,
+  alarmTone: 'default',
+};
+
+export async function saveAlertSettings(settings: AlertSettings): Promise<void> {
+  await AsyncStorage.setItem(ALERT_SETTINGS_KEY, JSON.stringify(settings));
+}
+
+export async function getAlertSettings(): Promise<AlertSettings> {
+  const raw = await AsyncStorage.getItem(ALERT_SETTINGS_KEY);
+  if (!raw) return DEFAULT_ALERT_SETTINGS;
+  try {
+    return { ...DEFAULT_ALERT_SETTINGS, ...JSON.parse(raw) };
+  } catch {
+    return DEFAULT_ALERT_SETTINGS;
+  }
+}
+
 // ── Clear ──────────────────────────────────────────────────────────────────
 
 export async function clearSession(): Promise<void> {

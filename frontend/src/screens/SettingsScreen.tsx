@@ -3,6 +3,7 @@
  * Mirrors Settings.jsx from the PWA exactly:
  *  - Profile section: name, email, boarding stop (changeable), destination stop (optional)
  *  - Proximity Alert: toggle + boarding/destination alert stop selectors
+ *  - Alert Mode: vibrate toggle + alarm tone picker + test alert
  *  - Push Notifications: toggle
  *  - Logout
  */
@@ -20,11 +21,13 @@ import {
   Modal,
   FlatList,
   ActivityIndicator,
+  Vibration,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Ionicons from '@react-native-vector-icons/ionicons';
 import Colors from '../theme/colors';
-import { getUser, saveUser, clearSession, getToken } from '../services/storage';
+import { getUser, saveUser, clearSession, getToken, getAlertSettings, saveAlertSettings } from '../services/storage';
+import type { AlarmTone } from '../services/storage';
 import { authApi, trackingApi } from '../services/api';
 import TopBar from '../components/TopBar';
 
@@ -82,6 +85,72 @@ function StopSelectModal({
   );
 }
 
+// ── Alarm Tone Picker Bottom-Sheet ───────────────────────────────────────────
+const ALARM_TONE_OPTIONS: { value: AlarmTone; label: string; icon: string; description: string }[] = [
+  { value: 'default', label: 'Default', icon: 'notifications', description: 'System default notification sound' },
+  { value: 'gentle', label: 'Gentle', icon: 'musical-note', description: 'Soft, subtle notification tone' },
+  { value: 'urgent', label: 'Urgent', icon: 'volume-high', description: 'Louder, attention-grabbing tone' },
+  { value: 'silent', label: 'Silent', icon: 'volume-mute', description: 'No sound, vibration only' },
+];
+
+function AlarmToneModal({
+  visible,
+  selectedTone,
+  onSelect,
+  onClose,
+}: {
+  visible: boolean;
+  selectedTone: AlarmTone;
+  onSelect: (tone: AlarmTone) => void;
+  onClose: () => void;
+}) {
+  return (
+    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+      <View style={M.overlay}>
+        <TouchableOpacity style={M.backdrop} activeOpacity={1} onPress={onClose} />
+        <View style={M.sheet}>
+          <View style={M.handle} />
+          <View style={M.sheetHeader}>
+            <Text style={M.sheetTitle}>Select Alarm Tone</Text>
+            <TouchableOpacity onPress={onClose} style={M.closeBtn}>
+              <Ionicons name="close" size={22} color={Colors.black} />
+            </TouchableOpacity>
+          </View>
+          <View style={{ paddingBottom: 24 }}>
+            {ALARM_TONE_OPTIONS.map(option => (
+              <TouchableOpacity
+                key={option.value}
+                style={[M.stopItem, option.value === selectedTone && M.stopItemActive]}
+                onPress={() => onSelect(option.value)}
+                activeOpacity={0.7}
+              >
+                <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, gap: 12 }}>
+                  <View style={[AT.toneIconWrap, option.value === selectedTone && AT.toneIconWrapActive]}>
+                    <Ionicons
+                      name={option.icon as any}
+                      size={16}
+                      color={option.value === selectedTone ? Colors.mintDark : Colors.medGray}
+                    />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[M.stopItemText, option.value === selectedTone && M.stopItemTextActive]}>
+                      {option.label}
+                    </Text>
+                    <Text style={AT.toneDesc}>{option.description}</Text>
+                  </View>
+                </View>
+                {option.value === selectedTone && (
+                  <Ionicons name="checkmark" size={18} color={Colors.mintDark} />
+                )}
+              </TouchableOpacity>
+            ))}
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
 // ── Main Screen ──────────────────────────────────────────────────────────────
 export default function SettingsScreen({ navigation }: any) {
   const [user, setUser] = useState<any>(null);
@@ -98,6 +167,11 @@ export default function SettingsScreen({ navigation }: any) {
   // Push notifications
   const [notifEnabled, setNotifEnabled] = useState(false);
 
+  // Alert mode — vibrate + alarm tone
+  const [vibrateEnabled, setVibrateEnabled] = useState(true);
+  const [alarmTone, setAlarmTone] = useState<AlarmTone>('default');
+  const [alarmToneEdit, setAlarmToneEdit] = useState(false);
+
   // Destination stop
   const [hasCustomDest, setHasCustomDest] = useState(false);
   const [boardingEdit, setBoardingEdit] = useState(false);
@@ -113,6 +187,10 @@ export default function SettingsScreen({ navigation }: any) {
         if (typeof u.destination_alert_stop_id !== 'undefined') setDestinationAlertStopId(u.destination_alert_stop_id);
         if (typeof u.notifications_on !== 'undefined') setNotifEnabled(u.notifications_on);
       }
+    });
+    getAlertSettings().then(settings => {
+      setVibrateEnabled(settings.vibrateEnabled);
+      setAlarmTone(settings.alarmTone);
     });
     trackingApi.getStops()
       .then((res: any) => { if (Array.isArray(res.data) && res.data.length) setStops(res.data); })
@@ -199,6 +277,30 @@ export default function SettingsScreen({ navigation }: any) {
     finally { setSaving(false); }
   };
 
+  // ── Vibrate / Alarm Tone handlers ──────────────────────────────────────────
+  const handleVibrateToggle = async (val: boolean) => {
+    setVibrateEnabled(val);
+    await saveAlertSettings({ vibrateEnabled: val, alarmTone });
+  };
+
+  const handleAlarmToneChange = async (tone: AlarmTone) => {
+    setAlarmToneEdit(false);
+    setAlarmTone(tone);
+    await saveAlertSettings({ vibrateEnabled, alarmTone: tone });
+  };
+
+  const handleTestAlert = () => {
+    if (vibrateEnabled) {
+      Vibration.vibrate([0, 400, 200, 400]);
+    }
+    const toneLabel = ALARM_TONE_OPTIONS.find(o => o.value === alarmTone)?.label || 'Default';
+    Alert.alert(
+      '🔔 Test Alert',
+      `Vibrate: ${vibrateEnabled ? 'ON' : 'OFF'}\nAlarm Tone: ${toneLabel}\n\n${vibrateEnabled ? 'You should have felt a vibration.' : 'Vibration is disabled.'}`,
+      [{ text: 'OK' }],
+    );
+  };
+
   const handleLogout = () => {
     Alert.alert(
       'Log Out',
@@ -217,6 +319,8 @@ export default function SettingsScreen({ navigation }: any) {
     );
   };
 
+  const currentToneLabel = ALARM_TONE_OPTIONS.find(o => o.value === alarmTone)?.label || 'Default';
+
   return (
     <SafeAreaView style={S.safeArea} edges={['top']}>
       <StatusBar barStyle="dark-content" backgroundColor={Colors.bgGray} />
@@ -230,6 +334,9 @@ export default function SettingsScreen({ navigation }: any) {
         <View style={S.card}>
           {/* Name */}
           <View style={S.row}>
+            <View style={S.rowIconWrap}>
+              <Ionicons name="person-outline" size={18} color={Colors.mintDark} />
+            </View>
             <View style={S.rowContent}>
               <Text style={S.rowLabel}>Name</Text>
               <Text style={S.rowValue}>{user?.name || '—'}</Text>
@@ -240,6 +347,9 @@ export default function SettingsScreen({ navigation }: any) {
 
           {/* Email */}
           <View style={S.row}>
+            <View style={S.rowIconWrap}>
+              <Ionicons name="mail-outline" size={18} color={Colors.mintDark} />
+            </View>
             <View style={S.rowContent}>
               <Text style={S.rowLabel}>Email</Text>
               <Text style={S.rowValue} numberOfLines={1}>{user?.email || 'Not set'}</Text>
@@ -250,6 +360,9 @@ export default function SettingsScreen({ navigation }: any) {
 
           {/* Boarding Stop */}
           <View style={S.row}>
+            <View style={S.rowIconWrap}>
+              <Ionicons name="location-outline" size={18} color={Colors.mintDark} />
+            </View>
             <View style={S.rowContent}>
               <Text style={S.rowLabel}>Boarding Stop</Text>
               <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 2 }}>
@@ -265,6 +378,9 @@ export default function SettingsScreen({ navigation }: any) {
 
           {/* Custom Destination Toggle */}
           <View style={S.row}>
+            <View style={S.rowIconWrap}>
+              <Ionicons name="navigate-outline" size={18} color={Colors.mintDark} />
+            </View>
             <View style={[S.rowContent, { flex: 1 }]}>
               <Text style={S.rowLabel}>Different Destination Point</Text>
             </View>
@@ -283,6 +399,9 @@ export default function SettingsScreen({ navigation }: any) {
             <>
               <View style={S.divider} />
               <View style={S.row}>
+                <View style={S.rowIconWrap}>
+                  <Ionicons name="flag-outline" size={18} color={Colors.mintDark} />
+                </View>
                 <View style={S.rowContent}>
                   <Text style={S.rowLabel}>Destination Stop</Text>
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 2 }}>
@@ -302,6 +421,9 @@ export default function SettingsScreen({ navigation }: any) {
         <View style={S.card}>
           {/* Proximity Alert toggle */}
           <View style={S.row}>
+            <View style={S.rowIconWrap}>
+              <Ionicons name="radio-outline" size={18} color={Colors.mintDark} />
+            </View>
             <View style={[S.rowContent, { flex: 1 }]}>
               <Text style={S.rowLabel}>Proximity Alert</Text>
               <Text style={S.rowValue}>{alertEnabled ? 'Enabled' : 'Disabled'}</Text>
@@ -321,6 +443,9 @@ export default function SettingsScreen({ navigation }: any) {
               <View style={S.divider} />
               {/* Boarding Alert Stop */}
               <View style={S.row}>
+                <View style={S.rowIconWrap}>
+                  <Ionicons name="bus-outline" size={18} color={Colors.mintDark} />
+                </View>
                 <View style={S.rowContent}>
                   <Text style={S.rowLabel}>Boarding Alert Stop</Text>
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 2 }}>
@@ -339,6 +464,9 @@ export default function SettingsScreen({ navigation }: any) {
                 <>
                   <View style={S.divider} />
                   <View style={S.row}>
+                    <View style={S.rowIconWrap}>
+                      <Ionicons name="flag-outline" size={18} color={Colors.mintDark} />
+                    </View>
                     <View style={S.rowContent}>
                       <Text style={S.rowLabel}>Destination Alert Stop</Text>
                       <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 2 }}>
@@ -357,10 +485,67 @@ export default function SettingsScreen({ navigation }: any) {
           )}
         </View>
 
+        {/* ── Alert Mode ──────────────────────────────────────────────── */}
+        <Text style={S.sectionLabel}>Alert Mode</Text>
+        <View style={S.card}>
+          {/* Vibrate on Alert */}
+          <View style={S.row}>
+            <View style={S.rowIconWrap}>
+              <Ionicons name="phone-portrait-outline" size={18} color={Colors.mintDark} />
+            </View>
+            <View style={[S.rowContent, { flex: 1 }]}>
+              <Text style={S.rowLabel}>Vibrate on Alert</Text>
+              <Text style={S.rowValue}>{vibrateEnabled ? 'Enabled' : 'Disabled'}</Text>
+            </View>
+            <Switch
+              value={vibrateEnabled}
+              onValueChange={handleVibrateToggle}
+              trackColor={{ false: Colors.separator, true: Colors.mint }}
+              thumbColor={Colors.white}
+              ios_backgroundColor={Colors.separator}
+            />
+          </View>
+
+          <View style={S.divider} />
+
+          {/* Alarm Tone */}
+          <View style={S.row}>
+            <View style={S.rowIconWrap}>
+              <Ionicons name="musical-notes-outline" size={18} color={Colors.mintDark} />
+            </View>
+            <View style={S.rowContent}>
+              <Text style={S.rowLabel}>Alarm Tone</Text>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 2 }}>
+                <Text style={S.rowValue}>{currentToneLabel}</Text>
+                <TouchableOpacity onPress={() => setAlarmToneEdit(true)}>
+                  <Text style={S.changeLink}>Change</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+
+          <View style={S.divider} />
+
+          {/* Test Alert */}
+          <TouchableOpacity style={S.testAlertRow} onPress={handleTestAlert} activeOpacity={0.7}>
+            <View style={S.rowIconWrap}>
+              <Ionicons name="flash-outline" size={18} color={Colors.mintDark} />
+            </View>
+            <View style={S.rowContent}>
+              <Text style={S.testAlertText}>Test Alert</Text>
+              <Text style={S.testAlertSub}>Tap to preview vibration & sound</Text>
+            </View>
+            <Ionicons name="chevron-forward" size={18} color={Colors.lightGray} />
+          </TouchableOpacity>
+        </View>
+
         {/* ── Notifications ─────────────────────────────────────────── */}
         <Text style={S.sectionLabel}>Notifications</Text>
         <View style={S.card}>
           <View style={S.row}>
+            <View style={S.rowIconWrap}>
+              <Ionicons name="notifications-outline" size={18} color={Colors.mintDark} />
+            </View>
             <View style={[S.rowContent, { flex: 1 }]}>
               <Text style={S.rowLabel}>Push Notifications</Text>
               <Text style={S.rowValue}>{notifEnabled ? 'Enabled' : 'Disabled'}</Text>
@@ -427,9 +612,22 @@ export default function SettingsScreen({ navigation }: any) {
         onSelect={handleDestinationAlertChange}
         onClose={() => setDestinationAlertEdit(false)}
       />
+      <AlarmToneModal
+        visible={alarmToneEdit}
+        selectedTone={alarmTone}
+        onSelect={handleAlarmToneChange}
+        onClose={() => setAlarmToneEdit(false)}
+      />
     </SafeAreaView>
   );
 }
+
+// ── Alarm Tone Picker Styles ─────────────────────────────────────────────────
+const AT = StyleSheet.create({
+  toneIconWrap:       { width: 32, height: 32, borderRadius: 16, backgroundColor: Colors.bgGray, alignItems: 'center', justifyContent: 'center' },
+  toneIconWrapActive: { backgroundColor: Colors.mintLighter },
+  toneDesc:           { fontSize: 12, color: Colors.lightGray, marginTop: 2 },
+});
 
 // ── Stop Modal Styles ────────────────────────────────────────────────────────
 const M = StyleSheet.create({
@@ -446,26 +644,32 @@ const M = StyleSheet.create({
   stopItemTextActive: { fontWeight: '700', color: Colors.mintText },
 });
 
-// ── Main Styles ──────────────────────────────────────────────────────────────
+// ── Main Styles — consistent with RouteView card styling ─────────────────────
 const S = StyleSheet.create({
   safeArea:      { flex: 1, backgroundColor: Colors.bgGray },
   scrollContent: { paddingHorizontal: 20, paddingTop: 20, paddingBottom: 20 },
-  screenTitle:   { fontSize: 26, fontWeight: '800', color: Colors.black, marginBottom: 20, marginTop: 4 },
+  screenTitle:   { fontSize: 24, fontWeight: '800', color: Colors.black, marginBottom: 20, marginTop: 4, letterSpacing: -0.5 },
 
-  // Section label (like PWA's settings-section-label)
+  // Section label — matches RouteView sectionTitle style
   sectionLabel:  { fontSize: 13, fontWeight: '700', color: Colors.medGray, letterSpacing: 0.5, textTransform: 'uppercase', marginBottom: 8, marginLeft: 4, marginTop: 4 },
 
-  // Card
-  card:          { backgroundColor: Colors.white, borderRadius: 16, paddingHorizontal: 16, paddingVertical: 4, marginBottom: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 8, elevation: 2 },
+  // Card — matches RouteView timeline card: borderRadius 20, same shadow
+  card:          { backgroundColor: Colors.white, borderRadius: 20, paddingHorizontal: 16, paddingVertical: 4, marginBottom: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.05, shadowRadius: 16, elevation: 3 },
 
   // Rows
   row:           { flexDirection: 'row', paddingVertical: 14, alignItems: 'center' },
+  rowIconWrap:   { width: 34, height: 34, borderRadius: 12, backgroundColor: Colors.mintLighter, alignItems: 'center', justifyContent: 'center', marginRight: 12 },
   rowContent:    { flex: 1 },
   rowLabel:      { fontSize: 13, color: Colors.medGray, fontWeight: '500', marginBottom: 2 },
   rowValue:      { fontSize: 16, fontWeight: '600', color: Colors.black },
   changeLink:    { fontSize: 14, fontWeight: '600', color: Colors.mintDark, textDecorationLine: 'underline' },
 
   divider:       { height: 1, backgroundColor: Colors.separator, marginHorizontal: -16 },
+
+  // Test Alert row
+  testAlertRow:  { flexDirection: 'row', paddingVertical: 14, alignItems: 'center' },
+  testAlertText: { fontSize: 15, fontWeight: '700', color: Colors.mintDark },
+  testAlertSub:  { fontSize: 12, color: Colors.lightGray, marginTop: 2 },
 
   // Logout
   versionText:   { fontSize: 12, color: Colors.lightGray, textAlign: 'center', marginBottom: 8, marginTop: 8 },

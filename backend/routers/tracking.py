@@ -280,17 +280,7 @@ async def trip_state(db: AsyncSession = Depends(get_db)):
                     "next_trip_time": None,
                     "is_deviated": is_deviated,
                 }
-            else:
-                if is_gps_alive:
-                    return {
-                        "trip": "Unscheduled",
-                        "status": "active",
-                        "trip_id": target_trip.id,
-                        "late_by_minutes": None,
-                        "cancellation_reason": None,
-                        "next_trip_time": None,
-                    }
-
+                # Outside schedule window, return waiting or offline
                 is_waiting_window = False
                 if is_morning and (MORNING_WAIT_START <= time_mins < MORNING_START_MINS):
                     is_waiting_window = True
@@ -309,24 +299,21 @@ async def trip_state(db: AsyncSession = Depends(get_db)):
     # Fallback: time-window logic
     if today.weekday() >= 5:
         return {
-            "trip": "Unscheduled" if is_gps_alive else "Not in Service",
-            "status": "active" if is_gps_alive else "weekend",
+            "trip": "Not in Service",
+            "status": "weekend",
             "next_trip_time": "Mon 07:30 AM",
         }
 
     if today.weekday() == 4 and time_mins > EVENING_END_MINS:
         return {
-            "trip": "Unscheduled" if is_gps_alive else "Not in Service",
-            "status": "active" if is_gps_alive else "completed",
+            "trip": "Not in Service",
+            "status": "completed",
             "next_trip_time": "Mon 07:30 AM",
         }
 
     if MORNING_START_MINS <= time_mins <= MORNING_END_MINS or EVENING_START_MINS <= time_mins <= EVENING_END_MINS:
         dir_name = "Morning" if time_mins <= MORNING_END_MINS else "Evening"
         return {"trip": dir_name, "status": "active" if is_gps_alive else "connecting", "next_trip_time": None}
-    
-    if is_gps_alive:
-        return {"trip": "Unscheduled", "status": "active", "next_trip_time": None}
 
     if MORNING_WAIT_START <= time_mins < MORNING_START_MINS:
         return {"trip": "Not in Service", "status": "waiting", "next_trip_time": "07:30 AM"}

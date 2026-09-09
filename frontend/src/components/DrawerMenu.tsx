@@ -21,6 +21,8 @@ import {
   Image,
   TextInput,
   Modal,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import Ionicons from '@react-native-vector-icons/ionicons';
 
@@ -61,50 +63,56 @@ function SuggestionsModal({ visible, onClose }: { visible: boolean; onClose: () 
   };
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <View style={SM.overlay}>
         <TouchableOpacity style={SM.backdrop} activeOpacity={1} onPress={onClose} />
-        <View style={SM.sheet}>
-          <View style={SM.handle} />
-          <View style={SM.header}>
-            <Text style={SM.title}>Send Feedback</Text>
-            <TouchableOpacity onPress={onClose} style={SM.closeBtn}>
-              <Ionicons name="close" size={22} color={Colors.black} />
-            </TouchableOpacity>
-          </View>
-          {sent ? (
-            <View style={{ padding: 32, alignItems: 'center', gap: 12 }}>
-              <Ionicons name="checkmark-circle" size={48} color={Colors.mintDark} />
-              <Text style={{ fontSize: 16, fontWeight: '700', color: Colors.mintText }}>
-                Thank you for your feedback!
-              </Text>
-            </View>
-          ) : (
-            <View style={{ padding: 20 }}>
-              <TextInput
-                style={SM.input}
-                placeholder="Share your thoughts or report an issue…"
-                placeholderTextColor={Colors.medGray}
-                value={text}
-                onChangeText={setText}
-                multiline
-                maxLength={500}
-                numberOfLines={5}
-                textAlignVertical="top"
-              />
-              <Text style={SM.charCount}>{text.length}/500</Text>
-              <TouchableOpacity
-                style={[SM.sendBtn, (!text.trim() || sending) && SM.sendBtnDisabled]}
-                onPress={handleSend}
-                disabled={!text.trim() || sending}
-                activeOpacity={0.7}
-              >
-                <Ionicons name="send" size={16} color={Colors.white} />
-                <Text style={SM.sendBtnText}>{sending ? 'Sending…' : 'Send Feedback'}</Text>
+        <KeyboardAvoidingView 
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          style={{ width: '100%', alignItems: 'center' }}
+        >
+          <View style={SM.sheet}>
+            <View style={SM.header}>
+              <Text style={SM.title}>Send Feedback</Text>
+              <TouchableOpacity onPress={onClose} style={SM.closeBtn}>
+                <Ionicons name="close" size={22} color={Colors.black} />
               </TouchableOpacity>
             </View>
-          )}
-        </View>
+            <Text style={SM.subtitle}>Share your thoughts, issues, or ideas below.</Text>
+            
+            {sent ? (
+              <View style={{ padding: 32, alignItems: 'center', gap: 12 }}>
+                <Ionicons name="checkmark-circle" size={48} color={Colors.mintDark} />
+                <Text style={{ fontSize: 16, fontWeight: '700', color: Colors.mintText }}>
+                  Thank you for your feedback!
+                </Text>
+              </View>
+            ) : (
+              <View style={{ padding: 20 }}>
+                <TextInput
+                  style={SM.input}
+                  placeholder="I think the app could..."
+                  placeholderTextColor={Colors.medGray}
+                  value={text}
+                  onChangeText={setText}
+                  multiline
+                  maxLength={500}
+                  numberOfLines={5}
+                  textAlignVertical="top"
+                />
+                <Text style={SM.charCount}>{text.length}/500</Text>
+                <TouchableOpacity
+                  style={[SM.sendBtn, (!text.trim() || sending) && SM.sendBtnDisabled]}
+                  onPress={handleSend}
+                  disabled={!text.trim() || sending}
+                  activeOpacity={0.7}
+                >
+                  <Ionicons name="send" size={16} color={Colors.white} />
+                  <Text style={SM.sendBtnText}>{sending ? 'Sending…' : 'Send'}</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          </View>
+        </KeyboardAvoidingView>
       </View>
     </Modal>
   );
@@ -226,16 +234,16 @@ export function DrawerProvider({ children }: { children: React.ReactNode }) {
 
 // ── Suggestions Modal Styles ──────────────────────────────────────────────
 const SM = StyleSheet.create({
-  overlay:     { flex: 1, justifyContent: 'flex-end' },
+  overlay:     { flex: 1, justifyContent: 'center', alignItems: 'center' },
   backdrop:    { ...StyleSheet.absoluteFill as any, backgroundColor: 'rgba(0,0,0,0.45)' },
-  sheet:       { backgroundColor: Colors.white, borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '65%', shadowColor: '#000', shadowOffset: { width: 0, height: -4 }, shadowOpacity: 0.12, shadowRadius: 20, elevation: 20 },
-  handle:      { width: 36, height: 4, borderRadius: 2, backgroundColor: Colors.separator, alignSelf: 'center', marginTop: 10, marginBottom: 4 },
-  header:      { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: Colors.separator },
-  title:       { fontSize: 16, fontWeight: '700', color: Colors.black },
-  closeBtn:    { padding: 4 },
-  input:       { borderWidth: 1.5, borderColor: Colors.borderGray, borderRadius: 12, padding: 12, fontSize: 14, color: Colors.black, minHeight: 100, backgroundColor: Colors.white },
-  charCount:   { fontSize: 11, color: Colors.lightGray, textAlign: 'right', marginTop: 4, marginBottom: 12 },
-  sendBtn:     { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: Colors.mintDark, borderRadius: 14, paddingVertical: 13 },
+  sheet:       { width: '90%', backgroundColor: Colors.white, borderRadius: 24, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.15, shadowRadius: 24, elevation: 15 },
+  header:      { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingTop: 20, paddingBottom: 10 },
+  title:       { fontSize: 18, fontWeight: '700', color: Colors.black },
+  subtitle:    { fontSize: 14, color: Colors.medGray, paddingHorizontal: 20, marginBottom: 16 },
+  closeBtn:    { padding: 4, backgroundColor: Colors.separator, borderRadius: 20 },
+  input:       { borderWidth: 1.5, borderColor: Colors.borderGray, borderRadius: 12, padding: 16, fontSize: 15, color: Colors.black, minHeight: 120, backgroundColor: Colors.white },
+  charCount:   { fontSize: 12, color: Colors.lightGray, textAlign: 'right', marginTop: 6, marginBottom: 16 },
+  sendBtn:     { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: Colors.mintDark, borderRadius: 14, paddingVertical: 14 },
   sendBtnDisabled: { opacity: 0.5 },
   sendBtnText: { fontSize: 15, fontWeight: '700', color: Colors.white },
 });

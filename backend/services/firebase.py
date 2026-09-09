@@ -12,13 +12,25 @@ logger = logging.getLogger(__name__)
 
 # Initialize Firebase Admin SDK using the local service account JSON
 try:
+    env_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
     cred_path = os.path.join(os.path.dirname(__file__), '..', 'firebase-service-account.json')
-    if os.path.exists(cred_path):
+    alt_cred_path = os.path.join(os.path.dirname(__file__), '..', 'firebase-services.json')
+    
+    if env_json:
+        import json
+        cred = credentials.Certificate(json.loads(env_json))
+        firebase_admin.initialize_app(cred)
+        logger.info("[FCM] Firebase Admin initialized successfully from ENV.")
+    elif os.path.exists(cred_path):
         cred = credentials.Certificate(cred_path)
         firebase_admin.initialize_app(cred)
-        logger.info("[FCM] Firebase Admin initialized successfully.")
+        logger.info("[FCM] Firebase Admin initialized successfully from %s", cred_path)
+    elif os.path.exists(alt_cred_path):
+        cred = credentials.Certificate(alt_cred_path)
+        firebase_admin.initialize_app(cred)
+        logger.info("[FCM] Firebase Admin initialized successfully from %s", alt_cred_path)
     else:
-        logger.warning("[FCM] firebase-service-account.json not found. Push notifications will be disabled.")
+        logger.warning("[FCM] firebase-service-account.json not found in ENV or files. Push notifications will be disabled.")
 except Exception as e:
     logger.error("[FCM] Failed to initialize Firebase Admin: %s", e)
 

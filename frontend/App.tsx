@@ -23,6 +23,8 @@ export type RootStackParamList = {
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
 
+import BootSplash from 'react-native-bootsplash';
+
 export default function App() {
   const [initialRoute, setInitialRoute] = useState<keyof RootStackParamList | null>(null);
 
@@ -43,7 +45,7 @@ export default function App() {
   return (
     <SafeAreaProvider>
       <DrawerProvider>
-        <NavigationContainer ref={navigationRef}>
+        <NavigationContainer ref={navigationRef} onReady={() => BootSplash.hide({ fade: true })}>
           <Stack.Navigator
             initialRouteName={initialRoute}
             screenOptions={{ headerShown: false, animation: 'slide_from_right' }}

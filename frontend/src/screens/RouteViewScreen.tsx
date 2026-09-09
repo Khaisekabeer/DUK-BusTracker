@@ -35,6 +35,7 @@ import TopBar from '../components/TopBar';
 import BusIdleAnimation from '../components/BusIdleAnimation';
 import { trackingApi } from '../services/api';
 import { getUser } from '../services/storage';
+import { haversineDistKm } from '../utils/math';
 
 const MAP_STYLE    = 'https://tiles.openfreemap.org/styles/liberty';
 // Geographic center of Thiruvananthapuram city — used as fallback before any data loads
@@ -211,7 +212,9 @@ export default function RouteViewScreen({ route, navigation }: any) {
   const [busPosition,  setBusPosition]  = useState<any>(null);
   const [routeHistory, setRouteHistory] = useState<any>(null);
   const [eta,          setEta]          = useState<any>(null);
+  const [plannedCoords, setPlannedCoords] = useState<[number, number][]>([]);
   const [trailCoords,  setTrailCoords]  = useState<[number, number][]>([]);
+  const [animatedBus,  setAnimatedBus]  = useState<[number, number] | null>(null);
   const [stops,        setStops]        = useState<any[]>([]);
   const [loading,      setLoading]      = useState(true);
   const [refreshing,   setRefreshing]   = useState(false);
@@ -219,7 +222,77 @@ export default function RouteViewScreen({ route, navigation }: any) {
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cameraRef   = useRef<any>(null);
+  const scrollViewRef = useRef<ScrollView>(null);
+  const animIntervalRef = useRef<any>(null);
+  const currentPosRef = useRef<[number, number] | null>(null);
   const pulseAnim   = useRef(new Animated.Value(1)).current;
+
+  const animateBusTo = useCallback(async (targetLat: number, targetLon: number) => {
+    const startPos = currentPosRef.current || [targetLon, targetLat];
+    const [startLon, startLat] = startPos;
+    const distKm = haversineDistKm(startLon, startLat, targetLon, targetLat);
+
+    if (!currentPosRef.current || distKm > 8.0 || distKm < 0.0005) {
+      setAnimatedBus([targetLon, targetLat]);
+      currentPosRef.current = [targetLon, targetLat];
+      return;
+    }
+
+    let polyline = [[startLon, startLat], [targetLon, targetLat]];
+    try {
+      const seg = await trackingApi.getRouteSegment(startLat, startLon, targetLat, targetLon);
+      if (seg.data?.coordinates?.length > 1) polyline = seg.data.coordinates;
+    } catch (_) { }
+
+    const cumDists = [0];
+    for (let i = 1; i < polyline.length; i++) {
+      cumDists.push(cumDists[i - 1] + haversineDistKm(polyline[i - 1][0], polyline[i - 1][1], polyline[i][0], polyline[i][1]));
+    }
+    const totalDist = cumDists[cumDists.length - 1];
+
+    if (totalDist <= 0.00001) {
+      setAnimatedBus([targetLon, targetLat]);
+      currentPosRef.current = [targetLon, targetLat];
+      return;
+    }
+
+    if (animIntervalRef.current) cancelAnimationFrame(animIntervalRef.current);
+
+    const duration = 15000; // POLL_MS
+    const startTime = Date.now();
+
+    const step = () => {
+      let progress = (Date.now() - startTime) / duration;
+      if (progress > 1.0) progress = 1.0;
+
+      const currentDist = progress * totalDist;
+      let segIdx = 0;
+      while (segIdx < cumDists.length - 2 && cumDists[segIdx + 1] < currentDist) {
+        segIdx++;
+      }
+
+      const p1 = polyline[segIdx];
+      const p2 = polyline[segIdx + 1];
+      const segSpan = (cumDists[segIdx + 1] - cumDists[segIdx]) || 0.00001;
+      const segFrac = Math.max(0, Math.min(1, (currentDist - cumDists[segIdx]) / segSpan));
+
+      const curLon = p1[0] + (p2[0] - p1[0]) * segFrac;
+      const curLat = p1[1] + (p2[1] - p1[1]) * segFrac;
+
+      setAnimatedBus([curLon, curLat]);
+      currentPosRef.current = [curLon, curLat];
+
+      if (progress < 1.0) {
+        animIntervalRef.current = requestAnimationFrame(step);
+      } else {
+        const finalPoint = polyline[polyline.length - 1];
+        setAnimatedBus(finalPoint as [number, number]);
+        currentPosRef.current = finalPoint as [number, number];
+      }
+    };
+
+    animIntervalRef.current = requestAnimationFrame(step);
+  }, []);
 
   useEffect(() => {
     Animated.loop(
@@ -236,31 +309,37 @@ export default function RouteViewScreen({ route, navigation }: any) {
     if (isRefresh) setRefreshing(true);
     setError('');
     try {
-      const [tripRes, busRes, historyRes, stopsRes, trailRes] = await Promise.all([
+      const [tripRes, busRes, historyRes, stopsRes, geoRes] = await Promise.allSettled([
         trackingApi.getTripState(),
-        trackingApi.getLatest().catch(() => null),
-        trackingApi.getRouteHistory().catch(() => null),
-        trackingApi.getStops().catch(() => null),
-        trackingApi.getHistoryForDate(todayStr()).catch(() => null),
+        trackingApi.getLatest(),
+        trackingApi.getRouteHistory(),
+        trackingApi.getStops(),
+        plannedCoords.length === 0 ? trackingApi.getRouteGeometry() : Promise.resolve(null),
       ]);
-      setTripState(tripRes.data);
-      if (busRes)     setBusPosition(busRes.data);
-      if (historyRes) setRouteHistory(historyRes.data);
-      if (stopsRes)   setStops(stopsRes.data ?? []);
-      if (trailRes?.data?.length) {
-        setTrailCoords(trailRes.data.map((p: any) => [p.lon, p.lat]));
+      const trip = tripRes.status === 'fulfilled' ? tripRes.value?.data : null;
+      const bus = busRes.status === 'fulfilled' ? busRes.value?.data : null;
+      const history = historyRes.status === 'fulfilled' ? historyRes.value?.data : null;
+      const fetchedStops = stopsRes.status === 'fulfilled' ? stopsRes.value?.data?.stops : null;
+      const geo = geoRes.status === 'fulfilled' ? geoRes.value?.data : null;
+
+      if (trip) setTripState(trip);
+      if (bus && bus.lat && bus.lon) {
+        setBusPosition(bus);
+        animateBusTo(bus.lat, bus.lon);
       }
+      if (history) {
+        setRouteHistory(history);
+        if (history.coords) {
+          setTrailCoords(history.coords.map((c: any) => [c.lon, c.lat]));
+        }
+      }
+      if (fetchedStops) setStops(fetchedStops);
+      if (geo?.coordinates) setPlannedCoords(geo.coordinates);
+
       const stopId = user?.boarding_stop_id ?? boardingPoint?.id;
-      if (stopId) {
+      if (stopId && bus?.is_live) {
         const etaRes = await trackingApi.getEta(stopId).catch(() => null);
         if (etaRes) setEta(etaRes.data);
-      }
-      if (busRes?.data?.lat && cameraRef.current) {
-        cameraRef.current.flyTo({
-          center:   [busRes.data.lon, busRes.data.lat] as [number, number],
-          zoom:     13,
-          duration: 800,
-        });
       }
     } catch {
       setError('Could not load bus data. Pull down to refresh.');
@@ -268,22 +347,24 @@ export default function RouteViewScreen({ route, navigation }: any) {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [user, boardingPoint]);
+  }, [user, boardingPoint, animateBusTo, plannedCoords.length]);
 
   useEffect(() => {
     fetchData();
-    intervalRef.current = setInterval(() => fetchData(), POLL_MS);
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+    intervalRef.current = setInterval(() => fetchData(), 15000);
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (animIntervalRef.current) cancelAnimationFrame(animIntervalRef.current);
+    };
   }, [fetchData]);
 
   // Derived values
   const status        = tripState?.status || 'offline';
   const isOnline      = status === 'active' || status === 'connecting';
-  const isIdleMode    = status === 'offline' || status === 'cancelled' || status === 'completed' || status === 'waiting';
   const tripName      = tripState?.trip || '';
+  const isUnscheduled = tripState?.is_deviated || tripName === 'Unscheduled' || tripName === 'Live Location';
+  const isIdleMode    = status === 'offline' || status === 'cancelled' || status === 'completed' || status === 'waiting' || isUnscheduled;
   const nextTripTime  = tripState?.next_trip_time || null;
-  const lateMins      = tripState?.late_by_minutes || 0;
-  const isUnscheduled = tripState?.is_deviated || false;
   const isLive        = status === 'active';
 
   // Morning trip: visible 6:00 AM - 11:00 AM. Evening trip: visible from 4:40 PM (starts 5:40 PM).
@@ -294,26 +375,20 @@ export default function RouteViewScreen({ route, navigation }: any) {
   function getSubtextStatus(): string {
     if (isIdleMode) {
       if (status === 'cancelled') return 'Trip cancelled';
+      if (isUnscheduled) return 'Bus is active off-schedule (See Live Map)';
       return nextTripTime ? `Next trip at ${nextTripTime}` : 'Bus is offline';
     }
     if (status === 'connecting') return 'Connecting to bus...';
     
     let sub = `${tripName || 'Active Trip'} → ${destination}`;
-    if (lateMins > 0) sub += ` • Delayed by ${lateMins} mins`;
-    else if (lateMins < 0) sub += ` • Ahead by ${Math.abs(lateMins)} mins`;
+    if (tripState?.late_by_minutes > 0) sub += ` • Delayed by ${tripState.late_by_minutes} mins`;
+    else if (tripState?.late_by_minutes < 0) sub += ` • Ahead by ${Math.abs(tripState.late_by_minutes)} mins`;
     else sub += ` • On time`;
     return sub;
   }
 
-  const busCoord: [number, number] | null = busPosition?.lat && busPosition?.lon
-    ? [busPosition.lon, busPosition.lat]
-    : null;
-
-  const trailGeoJSON = {
-    type: 'Feature' as const,
-    geometry: { type: 'LineString' as const, coordinates: trailCoords },
-    properties: {}
-  };
+  const trailGeoJSON = { type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: trailCoords }, properties: {} };
+  const plannedGeoJSON = { type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: plannedCoords }, properties: {} };
 
   const visitedMap: Record<string, string> = routeHistory?.arrivalTimes || {};
   const visitedNames = new Set<string>(Object.keys(routeHistory?.visitedStops || {}));
@@ -325,9 +400,33 @@ export default function RouteViewScreen({ route, navigation }: any) {
   const currentStopIndex = displayStops.findIndex((s: any) => !visitedNames.has(s.name));
   const currentStopName = currentStopIndex !== -1 ? displayStops[currentStopIndex].name : null;
 
-  const etaMinutes  = eta?.eta_minutes ?? null;
+  const etaText = (() => {
+    if (!eta || !isOnline) return '—';
+    if (eta.status === 'passed' || eta.status === 'deviated') return '—';
+    if (eta.eta_minutes != null) return `${Math.round(eta.eta_minutes)} min`;
+    return '—';
+  })();
+  
   const doneCount   = visitedNames.size;
   const totalCount  = stops.length || 21;
+
+  useEffect(() => {
+    if (currentStopIndex > 0 && scrollViewRef.current) {
+      const offset = (currentStopIndex - 1) * 54;
+      scrollViewRef.current.scrollTo({ y: Math.max(0, offset), animated: true });
+    }
+  }, [currentStopIndex]);
+
+  const mapVp = getMapViewport(displayStops, animatedBus || null);
+  useEffect(() => {
+    if (cameraRef.current && mapVp.center) {
+      cameraRef.current.easeTo({
+        center: mapVp.center,
+        zoom: mapVp.zoom,
+        duration: 800,
+      });
+    }
+  }, [mapVp.center[0], mapVp.center[1], mapVp.zoom]);
 
   const timeline = displayStops.map((stop: any, idx: number) => {
     const isVisited = visitedNames.has(stop.name);
@@ -337,14 +436,11 @@ export default function RouteViewScreen({ route, navigation }: any) {
     const scheduledDaily = stop.scheduled_time ?? (isEvening ? EVENING_SCHEDULE[stop.name] : MORNING_SCHEDULE[stop.name]) ?? (isEvening ? '06:00 PM' : '08:00 AM');
 
     let progress = (isVisited || isMissed) ? 1.0 : 0.0;
-    // Calculate relative progress to the next stop if this is the current active segment
     if (isCurrent && idx < displayStops.length - 1 && busPosition?.lat && busPosition?.lon) {
       const nextStop = displayStops[idx + 1];
-      const dTotal = getHaversineDistanceKm(Number(stop.lat), Number(stop.lon), Number(nextStop.lat), Number(nextStop.lon));
-      const dRemaining = getHaversineDistanceKm(Number(busPosition.lat), Number(busPosition.lon), Number(nextStop.lat), Number(nextStop.lon));
-      if (dTotal > 0.05) {
-        progress = Math.max(0.0, Math.min(1.0, 1.0 - (dRemaining / dTotal)));
-      }
+      const dTotal = haversineDistKm(Number(stop.lat), Number(stop.lon), Number(nextStop.lat), Number(nextStop.lon));
+      const dRemaining = haversineDistKm(Number(busPosition.lat), Number(busPosition.lon), Number(nextStop.lat), Number(nextStop.lon));
+      if (dTotal > 0.05) progress = Math.max(0.0, Math.min(1.0, 1.0 - (dRemaining / dTotal)));
     }
 
     let liveTime: string | null = null;
@@ -361,25 +457,12 @@ export default function RouteViewScreen({ route, navigation }: any) {
     } else if (isMissed) {
       statusSubtext = 'Missed';
     } else if (isOnline) {
-      // If live trip is active, compute estimated arrival time based on delay
       liveTime = computeEstimatedTime(scheduledDaily, globalDelay);
-      if (globalDelay > 1) {
-        delayType = 'late';
-      } else if (globalDelay < -1) {
-        delayType = 'ahead';
-      } else {
-        delayType = 'ontime';
-      }
-
-      if (isCurrent) {
-        statusSubtext = etaMinutes != null ? `Approaching • ETA ${etaMinutes} min` : 'Next Stop';
-      } else if (delayType === 'late') {
-        statusSubtext = `+${globalDelay}m delay`;
-      } else if (delayType === 'ahead') {
-        statusSubtext = `${Math.abs(globalDelay)}m ahead`;
-      } else {
-        statusSubtext = 'On time';
-      }
+      delayType = globalDelay > 1 ? 'late' : globalDelay < -1 ? 'ahead' : 'ontime';
+      if (isCurrent) statusSubtext = eta.eta_minutes != null ? `Approaching • ${Math.round(eta.eta_minutes)}m` : 'Next Stop';
+      else if (delayType === 'late') statusSubtext = `+${globalDelay}m delay`;
+      else if (delayType === 'ahead') statusSubtext = `${Math.abs(globalDelay)}m ahead`;
+      else statusSubtext = 'On time';
     } else {
       statusSubtext = 'Scheduled';
     }
@@ -464,14 +547,8 @@ export default function RouteViewScreen({ route, navigation }: any) {
         {!isIdleMode && (
           <View style={S.statsCard}>
             <View style={S.statItem}>
-              <Text style={S.statValue}>
-                {etaMinutes != null ? `${etaMinutes} min` : '—'}
-              </Text>
-              <Text style={S.statLabel} numberOfLines={1}>
-                {user?.boarding_stop_id
-                  ? `TO ${stops.find((s: any) => s.id === user.boarding_stop_id)?.name?.toUpperCase() ?? 'SAVED STOP'}`
-                  : 'NEXT STOP'}
-              </Text>
+              <Text style={S.statValue}>{etaText}</Text>
+              <Text style={S.statLabel} numberOfLines={1}>TO YOUR STOP</Text>
             </View>
             <View style={S.statDivider} />
             <View style={S.statItem}>
@@ -505,6 +582,7 @@ export default function RouteViewScreen({ route, navigation }: any) {
             </View>
           ) : (
             <ScrollView
+              ref={scrollViewRef}
               style={{ maxHeight: TIMELINE_VISIBLE_HEIGHT }}
               showsVerticalScrollIndicator={true}
               nestedScrollEnabled={true}
@@ -600,49 +678,30 @@ export default function RouteViewScreen({ route, navigation }: any) {
           activeOpacity={0.92}
           onPress={() => navigation.navigate('MapFull')}
         >
-          {/* Actual mini-map — starts at Thiruvananthapuram; Camera flies to bus when data loads */}
           <Map
             style={S.miniMap}
             mapStyle={MAP_STYLE}
+            scrollEnabled={false}
+            zoomEnabled={false}
+            pitchEnabled={false}
+            rotateEnabled={false}
           >
-            {(() => {
-              const { center, zoom } = getMapViewport(stops, busCoord);
-              return (
-                <Camera
-                  ref={cameraRef}
-                  initialViewState={{
-                    center: DEFAULT_CENTER,
-                    zoom:   DEFAULT_ZOOM,
-                  }}
-                  center={center}
-                  zoom={zoom}
-                  duration={0}
-                />
-              );
-            })()}
-            {trailCoords.length > 1 && (
-            <GeoJSONSource id="mini-trail" data={trailGeoJSON}>
-  <Layer
-    id="mini-trail-line"
-    type="line"
-    paint={{
-      "line-color": "#2563eb",
-      "line-width": 3,
-    }}
-    layout={{
-      "line-cap": "round",
-      "line-join": "round",
-    }}
-  />
-</GeoJSONSource>
+            <Camera ref={cameraRef} center={mapVp.center} zoom={mapVp.zoom} pitch={50} />
+
+            {plannedCoords.length > 1 && (
+              <GeoJSONSource id="mini-planned" data={plannedGeoJSON}>
+                <Layer id="mini-planned-line" type="line" paint={{ 'line-color': '#94a3b8', 'line-width': 2.5, 'line-opacity': 0.5 }} layout={{ 'line-cap': 'round', 'line-join': 'round' }} />
+              </GeoJSONSource>
             )}
-            {stops.map((stop: any) => (
-              <Marker key={`ms-${stop.id}`} id={`ms-${stop.id}`} lngLat={[stop.lon, stop.lat]}>
-                <View style={S.miniStopDot} />
-              </Marker>
-            ))}
-            {busCoord && (
-              <Marker id="mini-bus" lngLat={busCoord}>
+
+            {trailCoords.length > 1 && (
+              <GeoJSONSource id="mini-trail" data={trailGeoJSON}>
+                <Layer id="mini-trail-line" type="line" paint={{ "line-color": "#2563eb", "line-width": 3 }} layout={{ "line-cap": "round", "line-join": "round" }} />
+              </GeoJSONSource>
+            )}
+
+            {animatedBus && (
+              <Marker id="mini-bus" lngLat={animatedBus}>
                 <View style={S.adminMarkerContainer}>
                   <Ionicons name="location" size={42} color={isLive ? '#16a34a' : '#6b7280'} style={S.adminMarkerPin} />
                   <Ionicons name="bus" size={14} color="#ffffff" style={S.adminMarkerBus} />
