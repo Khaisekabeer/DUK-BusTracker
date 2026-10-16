@@ -27,13 +27,12 @@ import {
 import Ionicons from '@react-native-vector-icons/ionicons';
 
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { createNavigationContainerRef } from '@react-navigation/native';
 import Colors from '../theme/colors';
 import { getUser } from '../services/storage';
 import { suggestionApi } from '../services/api';
 import AboutModal from './AboutModal';
 
-export const navigationRef = createNavigationContainerRef<any>();
+import { navigationRef } from '../services/navigation';
 
 const DRAWER_WIDTH = Dimensions.get('window').width * 0.70;
 
@@ -42,7 +41,7 @@ type DrawerContextType = { openDrawer: () => void; closeDrawer: () => void };
 const DrawerContext = createContext<DrawerContextType>({ openDrawer: () => {}, closeDrawer: () => {} });
 export const useDrawer = () => useContext(DrawerContext);
 
-// ── Suggestions Mini-Modal ──────────────────────────────────────────────────
+// ── Help Modal removed in favor of HelpScreen ──
 function SuggestionsModal({ visible, onClose }: { visible: boolean; onClose: () => void }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
@@ -158,15 +157,13 @@ export function DrawerProvider({ children }: { children: React.ReactNode }) {
             <Animated.View
               style={[S.drawer, { paddingTop: insets.top, transform: [{ translateX: slideAnim }] }]}
             >
-              {/* ── Header: DUK logo + close ── */}
+              {/* ── Header: DUK logo + Close button ── */}
               <View style={S.drawerHeader}>
-                <Image
-                  source={require('../../duklogo.png')}
-                  style={S.headerLogo}
-                  resizeMode="contain"
-                />
+                <View style={S.headerLogos}>
+                  <Image source={require('../../duklogo.png')} style={S.headerLogo} resizeMode="contain" />
+                </View>
                 <TouchableOpacity onPress={closeDrawer} style={S.closeBtn}>
-                  <Ionicons name="close" size={20} color={Colors.medGray} />
+                  <Ionicons name="close" size={24} color={Colors.black} />
                 </TouchableOpacity>
               </View>
 
@@ -191,7 +188,7 @@ export function DrawerProvider({ children }: { children: React.ReactNode }) {
 
                 <TouchableOpacity
                   style={S.navItem}
-                  onPress={() => { closeDrawer(); /* navigate to Help */ }}
+                  onPress={() => { closeDrawer(); navigationRef?.navigate('Help'); }}
                   activeOpacity={0.7}
                 >
                   <Ionicons name="help-circle-outline" size={18} color={Colors.mintDark} style={S.navIcon} />
@@ -219,6 +216,11 @@ export function DrawerProvider({ children }: { children: React.ReactNode }) {
 
               {/* ── Footer ── */}
               <View style={S.footer}>
+                <Image
+                  source={require('../../canlab.png')}
+                  style={S.canlabLogoBottom}
+                  resizeMode="contain"
+                />
                 <Text style={S.versionText}>DUK Bus Tracker v1.0 Android</Text>
               </View>
             </Animated.View>
@@ -254,9 +256,10 @@ const S = StyleSheet.create({
   drawer:      { position: 'absolute', top: 0, bottom: 0, left: 0, width: DRAWER_WIDTH, backgroundColor: Colors.white, shadowColor: '#000', shadowOffset: { width: 4, height: 0 }, shadowOpacity: 0.15, shadowRadius: 20, elevation: 24, flexDirection: 'column' },
 
   // Header
-  drawerHeader:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: Colors.separator },
-  headerLogo:    { width: 100, height: 40 },
-  closeBtn:      { width: 36, height: 36, borderRadius: 8, justifyContent: 'center', alignItems: 'center' },
+  drawerHeader:  { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: Colors.separator },
+  headerLogos:   { flex: 1, alignItems: 'center', paddingTop: 8 },
+  headerLogo:    { width: 120, height: 42 },
+  closeBtn:      { width: 36, height: 36, borderRadius: 8, justifyContent: 'center', alignItems: 'center', position: 'absolute', right: 10, top: 10 },
 
   // Profile card
   profileCard:   { backgroundColor: Colors.mint50, paddingHorizontal: 16, paddingVertical: 18, borderBottomWidth: 1, borderBottomColor: Colors.border },
@@ -266,11 +269,12 @@ const S = StyleSheet.create({
 
   // Nav
   navContainer:  { paddingHorizontal: 8, paddingTop: 12, paddingBottom: 8 },
-  navItem:       { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 12, borderRadius: 14, marginBottom: 2 },
-  navIcon:       { marginRight: 12 },
-  navItemText:   { fontSize: 15, fontWeight: '500', color: Colors.darkGray, flex: 1 },
+  navItem:       { flexDirection: 'row', alignItems: 'center', paddingVertical: 14, paddingHorizontal: 12, borderRadius: 14, marginBottom: 4 },
+  navIcon:       { marginRight: 14, fontSize: 20 },
+  navItemText:   { fontSize: 17, fontWeight: '600', color: Colors.darkGray, flex: 1 },
 
   // Footer
-  footer:        { paddingHorizontal: 16, paddingVertical: 16, borderTopWidth: 1, borderTopColor: Colors.separator },
+  footer:        { paddingHorizontal: 16, paddingVertical: 16, borderTopWidth: 1, borderTopColor: Colors.separator, alignItems: 'center', gap: 8 },
+  canlabLogoBottom: { width: 100, height: 36 },
   versionText:   { fontSize: 11, color: Colors.lightGray },
 });

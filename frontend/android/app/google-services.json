@@ -1,26 +1,45 @@
 {
   "project_info": {
-    "project_number": "773406220529",
-    "project_id": "duk-bus-tracker",
-    "storage_bucket": "duk-bus-tracker.firebasestorage.app"
+    "project_number": "156522756954",
+    "firebase_url": "https://dukbus-bcf10-default-rtdb.asia-southeast1.firebasedatabase.app",
+    "project_id": "dukbus-bcf10",
+    "storage_bucket": "dukbus-bcf10.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:773406220529:android:78003a7e2fce916c44c950",
+        "mobilesdk_app_id": "1:156522756954:android:9c76e698b26ef5893fd163",
         "android_client_info": {
           "package_name": "com.bustracker"
         }
       },
-      "oauth_client": [],
+      "oauth_client": [
+        {
+          "client_id": "156522756954-1cd37j0tftk2m02d7u9qvcvknh3crc1p.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.bustracker",
+            "certificate_hash": "c2dc8046d5b5445abf014e9d9a646d20e57073c0"
+          }
+        },
+        {
+          "client_id": "156522756954-qs15rjov8ka7dj74vojs23ldmts43qk6.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
       "api_key": [
         {
-          "current_key": "AIzaSyCbBl1rtpQzrtH_6THdPBQb29cbLiwKSfE"
+          "current_key": "AIzaSyCdRNAPJmmHfFRElc_G6HVCzhSVlrSPRyg"
         }
       ],
       "services": {
         "appinvite_service": {
-          "other_platform_oauth_client": []
+          "other_platform_oauth_client": [
+            {
+              "client_id": "156522756954-qs15rjov8ka7dj74vojs23ldmts43qk6.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
         }
       }
     }

@@ -2,7 +2,7 @@
 import messaging from '@react-native-firebase/messaging';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import api from './api';
-import { Platform } from 'react-native';
+
 
 /**
  * Registers the device for push notifications.
@@ -31,7 +31,7 @@ export async function registerForPushNotificationsAsync() {
     if (!jwt) return;
 
     await api.put(
-      '/auth/device-token',
+      '/api/v1/auth/device-token',
       { device_token: token, notifications_on: true },
       { headers: { Authorization: `Bearer ${jwt}` } }
     );
@@ -47,9 +47,16 @@ export async function registerForPushNotificationsAsync() {
  * Called when the app is open and a push arrives.
  */
 export function registerForegroundHandler() {
-  return messaging().onMessage(async (remoteMessage: any) => {
-    // For now, simply log it. If you want a custom in-app notification UI,
-    // dispatch it to a Context or Redux store here.
-    console.log('[FCM] Foreground notification received:', remoteMessage);
-  });
+  try {
+    if (messaging && typeof messaging === 'function' && typeof messaging().onMessage === 'function') {
+      return messaging().onMessage(async (remoteMessage: any) => {
+        // For now, simply log it. If you want a custom in-app notification UI,
+        // dispatch it to a Context or Redux store here.
+        console.log('[FCM] Foreground notification received:', remoteMessage);
+      });
+    }
+  } catch (e) {
+    console.warn('[FCM] Could not register foreground handler:', e);
+  }
+  return () => {};
 }

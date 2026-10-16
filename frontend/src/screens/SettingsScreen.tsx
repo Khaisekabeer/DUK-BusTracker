@@ -1,11 +1,20 @@
 /**
  * SettingsScreen.tsx — DUK Bus Tracker Android
- * Mirrors Settings.jsx from the PWA exactly:
- *  - Profile section: name, email, boarding stop (changeable), destination stop (optional)
- *  - Proximity Alert: toggle + boarding/destination alert stop selectors
- *  - Alert Mode: vibrate toggle + alarm tone picker + test alert
- *  - Push Notifications: toggle
- *  - Logout
+ * Exact mirror of Settings.jsx from duk_pwa1 (Liquid Glass UI):
+ *  - TopBar with back arrow and centered "Settings" title
+ *  - Profile section card (Name, Email, Boarding Stop, Destination Stop)
+ *  - Notifications section:
+ *      - Enable all Notifications (master toggle card)
+ *      - When enabled (sub-card):
+ *          - Pickup Notification (toggle + change link)
+ *          - Drop-off Notification (toggle + change link)
+ *          - Trip Started (toggle + description)
+ *          - Delay Notification (toggle + description)
+ *          - General Announcements (toggle + description)
+ *          - Vibrate on Notification (toggle)
+ *          - Sound on Notification (toggle)
+ *  - Version text & Log Out button
+ *  - Floating StopSelectModal matching duk_pwa1
  */
 
 import React, { useState, useEffect } from 'react';
@@ -21,17 +30,38 @@ import {
   Modal,
   FlatList,
   ActivityIndicator,
-  Vibration,
+  ToastAndroid,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Ionicons from '@react-native-vector-icons/ionicons';
+import Sound from 'react-native-sound';
 import Colors from '../theme/colors';
-import { getUser, saveUser, clearSession, getToken, getAlertSettings, saveAlertSettings } from '../services/storage';
+import {
+  getUser,
+  saveUser,
+  clearSession,
+  getToken,
+  getAlertSettings,
+  saveAlertSettings,
+  saveAlertStash,
+  getAlertStash,
+} from '../services/storage';
 import type { AlarmTone } from '../services/storage';
 import { authApi, trackingApi } from '../services/api';
+import { registerForPushNotificationsAsync } from '../services/firebaseService';
 import TopBar from '../components/TopBar';
 
-// ── Stop Select Bottom-Sheet ─────────────────────────────────────────────────
+// Helper for Android Toast / alert feedback
+const showToast = (message: string) => {
+  if (Platform.OS === 'android') {
+    ToastAndroid.show(message, ToastAndroid.SHORT);
+  } else {
+    Alert.alert('', message);
+  }
+};
+
+// ── Stop Select Modal (matches duk_pwa1 StopSelectModal) ─────────────────────
 function StopSelectModal({
   visible,
   title,
@@ -39,45 +69,51 @@ function StopSelectModal({
   selectedStopId,
   onSelect,
   onClose,
+  showNone = false,
+  noneLabel = 'Not Set',
 }: {
   visible: boolean;
   title: string;
   stops: any[];
   selectedStopId: number | null;
-  onSelect: (stop: any) => void;
+  onSelect: (stop: any | null) => void;
   onClose: () => void;
+  showNone?: boolean;
+  noneLabel?: string;
 }) {
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <View style={M.overlay}>
         <TouchableOpacity style={M.backdrop} activeOpacity={1} onPress={onClose} />
-        <View style={M.sheet}>
-          <View style={M.handle} />
-          <View style={M.sheetHeader}>
-            <Text style={M.sheetTitle}>{title}</Text>
-            <TouchableOpacity onPress={onClose} style={M.closeBtn}>
+        <View style={M.card}>
+          <View style={M.header}>
+            <Text style={M.title}>{title}</Text>
+            <TouchableOpacity onPress={onClose} style={M.closeBtn} accessibilityLabel="Close">
               <Ionicons name="close" size={22} color={Colors.black} />
             </TouchableOpacity>
           </View>
           <FlatList
-            data={stops}
+            data={showNone ? [{ id: null, name: noneLabel }, ...stops] : stops}
             keyExtractor={item => String(item.id)}
-            showsVerticalScrollIndicator
-            contentContainerStyle={{ paddingBottom: 24 }}
-            renderItem={({ item }) => (
-              <TouchableOpacity
-                style={[M.stopItem, item.id === selectedStopId && M.stopItemActive]}
-                onPress={() => onSelect(item)}
-                activeOpacity={0.7}
-              >
-                <Text style={[M.stopItemText, item.id === selectedStopId && M.stopItemTextActive]}>
-                  {item.name}
-                </Text>
-                {item.id === selectedStopId && (
-                  <Ionicons name="checkmark" size={18} color={Colors.mintDark} />
-                )}
-              </TouchableOpacity>
-            )}
+            showsVerticalScrollIndicator={true}
+            contentContainerStyle={{ paddingBottom: 8 }}
+            renderItem={({ item }) => {
+              const isSelected = item.id === selectedStopId || (!item.id && !selectedStopId);
+              return (
+                <TouchableOpacity
+                  style={[M.stopItem, isSelected && M.stopItemActive]}
+                  onPress={() => onSelect(item.id === null ? null : item)}
+                  activeOpacity={0.7}
+                >
+                  <Text style={[M.stopItemText, isSelected && M.stopItemTextActive]}>
+                    {item.name}
+                  </Text>
+                  {isSelected && (
+                    <Ionicons name="checkmark" size={18} color={Colors.mintDark} />
+                  )}
+                </TouchableOpacity>
+              );
+            }}
           />
         </View>
       </View>
@@ -85,12 +121,12 @@ function StopSelectModal({
   );
 }
 
-// ── Alarm Tone Picker Bottom-Sheet ───────────────────────────────────────────
-const ALARM_TONE_OPTIONS: { value: AlarmTone; label: string; icon: string; description: string }[] = [
-  { value: 'default', label: 'Default', icon: 'notifications', description: 'System default notification sound' },
-  { value: 'gentle', label: 'Gentle', icon: 'musical-note', description: 'Soft, subtle notification tone' },
-  { value: 'urgent', label: 'Urgent', icon: 'volume-high', description: 'Louder, attention-grabbing tone' },
-  { value: 'silent', label: 'Silent', icon: 'volume-mute', description: 'No sound, vibration only' },
+// ── Alarm Tone Options & Modal ──────────────────────────────────────────────
+const ALARM_TONE_OPTIONS: { value: AlarmTone; label: string; icon: any; description: string }[] = [
+  { value: 'default', label: 'Default', icon: 'notifications-outline', description: 'System default notification sound' },
+  { value: 'gentle', label: 'Gentle', icon: 'musical-note-outline', description: 'Soft, subtle notification tone' },
+  { value: 'urgent', label: 'Urgent', icon: 'volume-high-outline', description: 'Louder, attention-grabbing tone' },
+  { value: 'silent', label: 'Silent', icon: 'volume-mute-outline', description: 'No sound, vibration only' },
 ];
 
 function AlarmToneModal({
@@ -104,102 +140,141 @@ function AlarmToneModal({
   onSelect: (tone: AlarmTone) => void;
   onClose: () => void;
 }) {
+  const handleSelectWithPreview = (tone: AlarmTone) => {
+    if (tone === 'gentle' || tone === 'urgent') {
+      try {
+        const s = new Sound(`${tone}_tone.mp3`, Sound.MAIN_BUNDLE, (error) => {
+          if (!error) {
+            s.play(() => s.release());
+          }
+        });
+      } catch {
+        // audio playback non-blocking
+      }
+    }
+    onSelect(tone);
+  };
+
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <View style={M.overlay}>
         <TouchableOpacity style={M.backdrop} activeOpacity={1} onPress={onClose} />
-        <View style={M.sheet}>
-          <View style={M.handle} />
-          <View style={M.sheetHeader}>
-            <Text style={M.sheetTitle}>Select Alarm Tone</Text>
-            <TouchableOpacity onPress={onClose} style={M.closeBtn}>
+        <View style={M.card}>
+          <View style={M.header}>
+            <Text style={M.title}>Select Notification Sound</Text>
+            <TouchableOpacity onPress={onClose} style={M.closeBtn} accessibilityLabel="Close">
               <Ionicons name="close" size={22} color={Colors.black} />
             </TouchableOpacity>
           </View>
-          <View style={{ paddingBottom: 24 }}>
-            {ALARM_TONE_OPTIONS.map(option => (
-              <TouchableOpacity
-                key={option.value}
-                style={[M.stopItem, option.value === selectedTone && M.stopItemActive]}
-                onPress={() => onSelect(option.value)}
-                activeOpacity={0.7}
-              >
-                <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, gap: 12 }}>
-                  <View style={[AT.toneIconWrap, option.value === selectedTone && AT.toneIconWrapActive]}>
-                    <Ionicons
-                      name={option.icon as any}
-                      size={16}
-                      color={option.value === selectedTone ? Colors.mintDark : Colors.medGray}
-                    />
+          <FlatList
+            data={ALARM_TONE_OPTIONS}
+            keyExtractor={item => item.value}
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={{ paddingBottom: 8 }}
+            renderItem={({ item }) => {
+              const isSelected = item.value === selectedTone;
+              return (
+                <TouchableOpacity
+                  style={[M.stopItem, isSelected && M.stopItemActive]}
+                  onPress={() => handleSelectWithPreview(item.value)}
+                  activeOpacity={0.7}
+                >
+                  <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, gap: 12 }}>
+                    <View style={[AT.toneIconWrap, isSelected && AT.toneIconWrapActive]}>
+                      <Ionicons
+                        name={item.icon}
+                        size={20}
+                        color={isSelected ? Colors.mintDark : Colors.medGray}
+                      />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[M.stopItemText, isSelected && M.stopItemTextActive]}>
+                        {item.label}
+                      </Text>
+                      <Text style={AT.toneDesc}>{item.description}</Text>
+                    </View>
                   </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={[M.stopItemText, option.value === selectedTone && M.stopItemTextActive]}>
-                      {option.label}
-                    </Text>
-                    <Text style={AT.toneDesc}>{option.description}</Text>
-                  </View>
-                </View>
-                {option.value === selectedTone && (
-                  <Ionicons name="checkmark" size={18} color={Colors.mintDark} />
-                )}
-              </TouchableOpacity>
-            ))}
-          </View>
+                  {isSelected && (
+                    <Ionicons name="checkmark" size={20} color={Colors.mintDark} />
+                  )}
+                </TouchableOpacity>
+              );
+            }}
+          />
         </View>
       </View>
     </Modal>
   );
 }
 
-// ── Main Screen ──────────────────────────────────────────────────────────────
+// ── Main Settings Screen ─────────────────────────────────────────────────────
 export default function SettingsScreen({ navigation }: any) {
   const [user, setUser] = useState<any>(null);
   const [stops, setStops] = useState<any[]>([]);
   const [saving, setSaving] = useState(false);
+  const [savingNotif, setSavingNotif] = useState(false);
 
-  // Proximity alert
-  const [alertEnabled, setAlertEnabled] = useState(false);
-  const [boardingAlertStopId, setBoardingAlertStopId] = useState<number | null>(null);
-  const [destinationAlertStopId, setDestinationAlertStopId] = useState<number | null>(null);
+  // Stop pickers
+  const [boardingEdit, setBoardingEdit] = useState(false);
+  const [destinationEdit, setDestinationEdit] = useState(false);
   const [boardingAlertEdit, setBoardingAlertEdit] = useState(false);
   const [destinationAlertEdit, setDestinationAlertEdit] = useState(false);
 
-  // Push notifications
-  const [notifEnabled, setNotifEnabled] = useState(false);
+  // Proximity stop alert selections
+  const [boardingAlertStopId, setBoardingAlertStopId] = useState<number | null>(null);
+  const [destinationAlertStopId, setDestinationAlertStopId] = useState<number | null>(null);
 
-  // Alert mode — vibrate + alarm tone
+  // Master alerts & audio/vibration toggles
+  const [masterAlertsEnabled, setMasterAlertsEnabled] = useState(false);
   const [vibrateEnabled, setVibrateEnabled] = useState(true);
+  const [soundEnabled, setSoundEnabled] = useState(true);
   const [alarmTone, setAlarmTone] = useState<AlarmTone>('default');
   const [alarmToneEdit, setAlarmToneEdit] = useState(false);
 
-  // Destination stop
-  const [hasCustomDest, setHasCustomDest] = useState(false);
-  const [boardingEdit, setBoardingEdit] = useState(false);
-  const [destinationEdit, setDestinationEdit] = useState(false);
+  // Fine-grained push notification preferences (server-synced)
+  const [notifyTripStarted, setNotifyTripStarted] = useState(true);
+  const [notifyDelays, setNotifyDelays] = useState(true);
+  const [notifyAdminBroadcasts, setNotifyAdminBroadcasts] = useState(true);
 
   useEffect(() => {
+    // 1. Load local alert preferences
+    getAlertSettings().then(settings => {
+      setVibrateEnabled(settings.vibrateEnabled);
+      setSoundEnabled(settings.soundEnabled);
+      setAlarmTone(settings.alarmTone || (settings.soundEnabled === false ? 'silent' : 'default'));
+      setMasterAlertsEnabled(settings.masterAlertsEnabled);
+    });
+
+    // 2. Load user & server-stored preferences
     getUser().then((u: any) => {
       if (u) {
         setUser(u);
-        if (u.destination_stop_id) setHasCustomDest(true);
-        if (typeof u.proximity_alert_enabled !== 'undefined') setAlertEnabled(u.proximity_alert_enabled);
-        if (typeof u.boarding_alert_stop_id !== 'undefined') setBoardingAlertStopId(u.boarding_alert_stop_id);
-        if (typeof u.destination_alert_stop_id !== 'undefined') setDestinationAlertStopId(u.destination_alert_stop_id);
-        if (typeof u.notifications_on !== 'undefined') setNotifEnabled(u.notifications_on);
+        if (typeof u.boarding_alert_stop_id !== 'undefined') {
+          setBoardingAlertStopId(u.boarding_alert_stop_id);
+        }
+        if (typeof u.destination_alert_stop_id !== 'undefined') {
+          setDestinationAlertStopId(u.destination_alert_stop_id);
+        }
+        setNotifyTripStarted(u.notify_trip_started !== false);
+        setNotifyDelays(u.notify_delays !== false);
+        setNotifyAdminBroadcasts(u.notify_admin_broadcasts !== false);
       }
     });
-    getAlertSettings().then(settings => {
-      setVibrateEnabled(settings.vibrateEnabled);
-      setAlarmTone(settings.alarmTone);
-    });
+
+    // 3. Fetch live stops list
     trackingApi.getStops()
-      .then((res: any) => { if (Array.isArray(res.data) && res.data.length) setStops(res.data); })
+      .then((res: any) => {
+        if (Array.isArray(res.data) && res.data.length) {
+          setStops(res.data);
+        }
+      })
       .catch(() => {});
   }, []);
 
   const currentStopName = stops.find(s => s.id === user?.boarding_stop_id)?.name || 'Not set';
-  const currentDestName = stops.find(s => s.id === user?.destination_stop_id)?.name || 'Not set';
+  const currentDestName = stops.find(s => s.id === (user?.destination_stop_id || user?.boarding_stop_id))?.name || 'Not set';
 
+  // Navigate back to Route
   const handleBack = async () => {
     if (navigation.canGoBack()) {
       navigation.goBack();
@@ -209,11 +284,21 @@ export default function SettingsScreen({ navigation }: any) {
     }
   };
 
+  // ── Profile Updates ────────────────────────────────────────────────────────
   const handleBoardingChange = async (stop: any) => {
     setBoardingEdit(false);
     const updated = { ...user, boarding_stop_id: stop.id };
     await saveUser(updated);
     setUser(updated);
+    setSaving(true);
+    try {
+      await authApi.updatePreferences({ boarding_stop_id: stop.id } as any);
+      showToast(`Boarding stop updated to ${stop.name}`);
+    } catch {
+      showToast('Could not save boarding stop.');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleDestinationChange = async (stop: any) => {
@@ -221,86 +306,162 @@ export default function SettingsScreen({ navigation }: any) {
     const updated = { ...user, destination_stop_id: stop.id };
     await saveUser(updated);
     setUser(updated);
-  };
-
-  const handleCustomDestToggle = async (val: boolean) => {
-    setHasCustomDest(val);
-    if (!val) {
-      const updated = { ...user, destination_stop_id: null, destination_alert_stop_id: null };
-      await saveUser(updated);
-      setUser(updated);
-      setSaving(true);
-      try { await authApi.updatePreferences({ destination_alert_stop_id: null }); } catch {}
-      finally { setSaving(false); }
+    setSaving(true);
+    try {
+      await authApi.updatePreferences({ destination_stop_id: stop.id });
+      showToast(`Destination stop updated to ${stop.name}`);
+    } catch {
+      showToast('Could not save destination stop.');
+    } finally {
+      setSaving(false);
     }
   };
 
-  const handleAlertToggle = async (val: boolean) => {
-    setAlertEnabled(val);
-    setSaving(true);
-    const updated = { ...user, proximity_alert_enabled: val };
-    await saveUser(updated);
-    setUser(updated);
-    try { await authApi.updatePreferences({ proximity_alert_enabled: val }); } catch {}
-    finally { setSaving(false); }
+  // ── Master Notifications Toggle ───────────────────────────────────────────
+  const handleMasterAlertsToggle = async (val: boolean) => {
+    setMasterAlertsEnabled(val);
+    const toneToSave = soundEnabled ? (alarmTone === 'silent' ? 'default' : alarmTone) : 'silent';
+    await saveAlertSettings({
+      vibrateEnabled,
+      soundEnabled,
+      alarmTone: toneToSave,
+      masterAlertsEnabled: val,
+    });
+
+    if (val) {
+      registerForPushNotificationsAsync().catch(() => {});
+      // Restore previous pickup/drop-off stops from stash so selection isn't lost
+      const stash = await getAlertStash();
+      if (!boardingAlertStopId && stash.boarding) {
+        const bStop = stops.find(s => s.id === stash.boarding) || { id: stash.boarding, name: 'your stop' };
+        await handleBoardingAlertChange(bStop);
+      }
+      if (!destinationAlertStopId && stash.destination) {
+        const dStop = stops.find(s => s.id === stash.destination) || { id: stash.destination, name: 'your stop' };
+        await handleDestinationAlertChange(dStop);
+      }
+    } else {
+      // Remember current selections before clearing them, then null stops server-side
+      await saveAlertStash({ boarding: boardingAlertStopId, destination: destinationAlertStopId });
+      if (boardingAlertStopId) await handleBoardingAlertChange(null);
+      if (destinationAlertStopId) await handleDestinationAlertChange(null);
+    }
   };
 
-  const handleNotifToggle = async (val: boolean) => {
-    setNotifEnabled(val);
-    setSaving(true);
-    const updated = { ...user, notifications_on: val };
-    await saveUser(updated);
-    setUser(updated);
-    try { await authApi.updatePreferences({ notifications_on: val }); } catch {}
-    finally { setSaving(false); }
+  // ── Pickup & Drop-off Proximity Alerts ────────────────────────────────────
+  const handleBoardingAlertToggle = async (val: boolean) => {
+    if (val) {
+      registerForPushNotificationsAsync().catch(() => {});
+      setBoardingAlertEdit(true);
+    } else {
+      await handleBoardingAlertChange(null);
+    }
+  };
+
+  const handleDestinationAlertToggle = async (val: boolean) => {
+    if (val) {
+      registerForPushNotificationsAsync().catch(() => {});
+      setDestinationAlertEdit(true);
+    } else {
+      await handleDestinationAlertChange(null);
+    }
   };
 
   const handleBoardingAlertChange = async (stop: any) => {
     setBoardingAlertEdit(false);
-    setBoardingAlertStopId(stop.id);
-    const updated = { ...user, boarding_alert_stop_id: stop.id };
+    const stopId = stop ? stop.id : null;
+    setBoardingAlertStopId(stopId);
+    const updated = { ...user, boarding_alert_stop_id: stopId };
     await saveUser(updated);
     setUser(updated);
     setSaving(true);
-    try { await authApi.updatePreferences({ boarding_alert_stop_id: stop.id }); } catch {}
-    finally { setSaving(false); }
+    try {
+      await authApi.updatePreferences({ boarding_alert_stop_id: stopId });
+      showToast(stop ? `Pick-up notification updated to ${stop.name}` : 'Pick-up notification disabled');
+    } catch {
+      showToast('Could not save pick-up alert.');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleDestinationAlertChange = async (stop: any) => {
     setDestinationAlertEdit(false);
-    setDestinationAlertStopId(stop.id);
-    const updated = { ...user, destination_alert_stop_id: stop.id };
+    const stopId = stop ? stop.id : null;
+    setDestinationAlertStopId(stopId);
+    const updated = { ...user, destination_alert_stop_id: stopId };
     await saveUser(updated);
     setUser(updated);
     setSaving(true);
-    try { await authApi.updatePreferences({ destination_alert_stop_id: stop.id }); } catch {}
-    finally { setSaving(false); }
+    try {
+      await authApi.updatePreferences({ destination_alert_stop_id: stopId });
+      showToast(stop ? `Drop-off notification updated to ${stop.name}` : 'Drop-off notification disabled');
+    } catch {
+      showToast('Could not save drop-off alert.');
+    } finally {
+      setSaving(false);
+    }
   };
 
-  // ── Vibrate / Alarm Tone handlers ──────────────────────────────────────────
+  // ── Push Notification Preferences ─────────────────────────────────────────
+  const handleNotifyToggle = async (field: string, val: boolean, setter: (v: boolean) => void) => {
+    setter(val);
+    if (val) {
+      registerForPushNotificationsAsync().catch(() => {});
+    }
+    const updated = { ...user, [field]: val };
+    await saveUser(updated);
+    setUser(updated);
+    setSavingNotif(true);
+    try {
+      await authApi.updatePreferences({ [field]: val } as any);
+      showToast(val ? 'Notification enabled' : 'Notification disabled');
+    } catch {
+      showToast('Could not save preference.');
+    } finally {
+      setSavingNotif(false);
+    }
+  };
+
+  // ── Vibrate & Sound Toggles ───────────────────────────────────────────────
   const handleVibrateToggle = async (val: boolean) => {
     setVibrateEnabled(val);
-    await saveAlertSettings({ vibrateEnabled: val, alarmTone });
+    await saveAlertSettings({
+      vibrateEnabled: val,
+      soundEnabled,
+      alarmTone,
+      masterAlertsEnabled,
+    });
+  };
+
+  const handleSoundToggle = async (val: boolean) => {
+    setSoundEnabled(val);
+    const updatedTone = val ? (alarmTone === 'silent' ? 'default' : alarmTone) : 'silent';
+    setAlarmTone(updatedTone);
+    await saveAlertSettings({
+      vibrateEnabled,
+      soundEnabled: val,
+      alarmTone: updatedTone,
+      masterAlertsEnabled,
+    });
   };
 
   const handleAlarmToneChange = async (tone: AlarmTone) => {
     setAlarmToneEdit(false);
     setAlarmTone(tone);
-    await saveAlertSettings({ vibrateEnabled, alarmTone: tone });
+    const isSoundOn = tone !== 'silent';
+    setSoundEnabled(isSoundOn);
+    await saveAlertSettings({
+      vibrateEnabled,
+      soundEnabled: isSoundOn,
+      alarmTone: tone,
+      masterAlertsEnabled,
+    });
+    const label = ALARM_TONE_OPTIONS.find(o => o.value === tone)?.label || tone;
+    showToast(`Sound updated to ${label}`);
   };
 
-  const handleTestAlert = () => {
-    if (vibrateEnabled) {
-      Vibration.vibrate([0, 400, 200, 400]);
-    }
-    const toneLabel = ALARM_TONE_OPTIONS.find(o => o.value === alarmTone)?.label || 'Default';
-    Alert.alert(
-      '🔔 Test Alert',
-      `Vibrate: ${vibrateEnabled ? 'ON' : 'OFF'}\nAlarm Tone: ${toneLabel}\n\n${vibrateEnabled ? 'You should have felt a vibration.' : 'Vibration is disabled.'}`,
-      [{ text: 'OK' }],
-    );
-  };
-
+  // ── Logout ────────────────────────────────────────────────────────────────
   const handleLogout = () => {
     Alert.alert(
       'Log Out',
@@ -311,6 +472,11 @@ export default function SettingsScreen({ navigation }: any) {
           text: 'Log Out',
           style: 'destructive',
           onPress: async () => {
+            try {
+              await authApi.logout();
+            } catch {
+              // Server logout error ignored; session cleared locally
+            }
             await clearSession();
             navigation.reset({ index: 0, routes: [{ name: 'ProfileSetup' }] });
           },
@@ -319,267 +485,255 @@ export default function SettingsScreen({ navigation }: any) {
     );
   };
 
-  const currentToneLabel = ALARM_TONE_OPTIONS.find(o => o.value === alarmTone)?.label || 'Default';
-
   return (
     <SafeAreaView style={S.safeArea} edges={['top']}>
       <StatusBar barStyle="dark-content" backgroundColor={Colors.bgGray} />
-      <TopBar showBack onBack={handleBack} />
+      <TopBar showBack onBack={handleBack} title="Settings" />
 
       <ScrollView contentContainerStyle={S.scrollContent} showsVerticalScrollIndicator={false}>
         <Text style={S.screenTitle}>Settings</Text>
 
-        {/* ── Profile ───────────────────────────────────────────────── */}
+        {/* ── Profile Section ───────────────────────────────────────── */}
         <Text style={S.sectionLabel}>Profile</Text>
         <View style={S.card}>
           {/* Name */}
           <View style={S.row}>
-            <View style={S.rowIconWrap}>
-              <Ionicons name="person-outline" size={18} color={Colors.mintDark} />
-            </View>
             <View style={S.rowContent}>
               <Text style={S.rowLabel}>Name</Text>
               <Text style={S.rowValue}>{user?.name || '—'}</Text>
             </View>
           </View>
 
-          <View style={S.divider} />
-
           {/* Email */}
           <View style={S.row}>
-            <View style={S.rowIconWrap}>
-              <Ionicons name="mail-outline" size={18} color={Colors.mintDark} />
-            </View>
             <View style={S.rowContent}>
               <Text style={S.rowLabel}>Email</Text>
               <Text style={S.rowValue} numberOfLines={1}>{user?.email || 'Not set'}</Text>
             </View>
           </View>
 
-          <View style={S.divider} />
-
           {/* Boarding Stop */}
           <View style={S.row}>
-            <View style={S.rowIconWrap}>
-              <Ionicons name="location-outline" size={18} color={Colors.mintDark} />
-            </View>
             <View style={S.rowContent}>
               <Text style={S.rowLabel}>Boarding Stop</Text>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 2 }}>
+              <View style={S.valueWithAction}>
                 <Text style={S.rowValue}>{currentStopName}</Text>
-                <TouchableOpacity onPress={() => setBoardingEdit(true)}>
+                <TouchableOpacity onPress={() => setBoardingEdit(true)} activeOpacity={0.7}>
                   <Text style={S.changeLink}>Change</Text>
                 </TouchableOpacity>
               </View>
             </View>
           </View>
 
-          <View style={S.divider} />
-
-          {/* Custom Destination Toggle */}
-          <View style={S.row}>
-            <View style={S.rowIconWrap}>
-              <Ionicons name="navigate-outline" size={18} color={Colors.mintDark} />
-            </View>
-            <View style={[S.rowContent, { flex: 1 }]}>
-              <Text style={S.rowLabel}>Different Destination Point</Text>
-            </View>
-            <Switch
-              value={hasCustomDest}
-              onValueChange={handleCustomDestToggle}
-              trackColor={{ false: Colors.separator, true: Colors.mint }}
-              thumbColor={Colors.white}
-              ios_backgroundColor={Colors.separator}
-              disabled={saving}
-            />
-          </View>
-
-          {/* Destination Stop (conditional) */}
-          {hasCustomDest && (
-            <>
-              <View style={S.divider} />
-              <View style={S.row}>
-                <View style={S.rowIconWrap}>
-                  <Ionicons name="flag-outline" size={18} color={Colors.mintDark} />
-                </View>
-                <View style={S.rowContent}>
-                  <Text style={S.rowLabel}>Destination Stop</Text>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 2 }}>
-                    <Text style={S.rowValue}>{currentDestName}</Text>
-                    <TouchableOpacity onPress={() => setDestinationEdit(true)}>
-                      <Text style={S.changeLink}>Change</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              </View>
-            </>
-          )}
-        </View>
-
-        {/* ── Preferences ───────────────────────────────────────────── */}
-        <Text style={S.sectionLabel}>Preferences</Text>
-        <View style={S.card}>
-          {/* Proximity Alert toggle */}
-          <View style={S.row}>
-            <View style={S.rowIconWrap}>
-              <Ionicons name="radio-outline" size={18} color={Colors.mintDark} />
-            </View>
-            <View style={[S.rowContent, { flex: 1 }]}>
-              <Text style={S.rowLabel}>Proximity Alert</Text>
-              <Text style={S.rowValue}>{alertEnabled ? 'Enabled' : 'Disabled'}</Text>
-            </View>
-            <Switch
-              value={alertEnabled}
-              onValueChange={handleAlertToggle}
-              trackColor={{ false: Colors.separator, true: Colors.mint }}
-              thumbColor={Colors.white}
-              ios_backgroundColor={Colors.separator}
-              disabled={saving}
-            />
-          </View>
-
-          {alertEnabled && (
-            <>
-              <View style={S.divider} />
-              {/* Boarding Alert Stop */}
-              <View style={S.row}>
-                <View style={S.rowIconWrap}>
-                  <Ionicons name="bus-outline" size={18} color={Colors.mintDark} />
-                </View>
-                <View style={S.rowContent}>
-                  <Text style={S.rowLabel}>Boarding Alert Stop</Text>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 2 }}>
-                    <Text style={S.rowValue}>
-                      {stops.find(s => s.id === boardingAlertStopId)?.name || 'Not set'}
-                    </Text>
-                    <TouchableOpacity onPress={() => setBoardingAlertEdit(true)} disabled={saving}>
-                      <Text style={S.changeLink}>Change</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              </View>
-
-              {/* Destination Alert Stop (only if custom dest enabled) */}
-              {hasCustomDest && (
-                <>
-                  <View style={S.divider} />
-                  <View style={S.row}>
-                    <View style={S.rowIconWrap}>
-                      <Ionicons name="flag-outline" size={18} color={Colors.mintDark} />
-                    </View>
-                    <View style={S.rowContent}>
-                      <Text style={S.rowLabel}>Destination Alert Stop</Text>
-                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 2 }}>
-                        <Text style={S.rowValue}>
-                          {stops.find(s => s.id === destinationAlertStopId)?.name || 'Not set'}
-                        </Text>
-                        <TouchableOpacity onPress={() => setDestinationAlertEdit(true)} disabled={saving}>
-                          <Text style={S.changeLink}>Change</Text>
-                        </TouchableOpacity>
-                      </View>
-                    </View>
-                  </View>
-                </>
-              )}
-            </>
-          )}
-        </View>
-
-        {/* ── Alert Mode ──────────────────────────────────────────────── */}
-        <Text style={S.sectionLabel}>Alert Mode</Text>
-        <View style={S.card}>
-          {/* Vibrate on Alert */}
-          <View style={S.row}>
-            <View style={S.rowIconWrap}>
-              <Ionicons name="phone-portrait-outline" size={18} color={Colors.mintDark} />
-            </View>
-            <View style={[S.rowContent, { flex: 1 }]}>
-              <Text style={S.rowLabel}>Vibrate on Alert</Text>
-              <Text style={S.rowValue}>{vibrateEnabled ? 'Enabled' : 'Disabled'}</Text>
-            </View>
-            <Switch
-              value={vibrateEnabled}
-              onValueChange={handleVibrateToggle}
-              trackColor={{ false: Colors.separator, true: Colors.mint }}
-              thumbColor={Colors.white}
-              ios_backgroundColor={Colors.separator}
-            />
-          </View>
-
-          <View style={S.divider} />
-
-          {/* Alarm Tone */}
-          <View style={S.row}>
-            <View style={S.rowIconWrap}>
-              <Ionicons name="musical-notes-outline" size={18} color={Colors.mintDark} />
-            </View>
+          {/* Destination Stop */}
+          <View style={[S.row, S.rowLast]}>
             <View style={S.rowContent}>
-              <Text style={S.rowLabel}>Alarm Tone</Text>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 2 }}>
-                <Text style={S.rowValue}>{currentToneLabel}</Text>
-                <TouchableOpacity onPress={() => setAlarmToneEdit(true)}>
+              <Text style={S.rowLabel}>Destination Stop</Text>
+              <View style={S.valueWithAction}>
+                <Text style={S.rowValue}>{currentDestName}</Text>
+                <TouchableOpacity onPress={() => setDestinationEdit(true)} activeOpacity={0.7}>
                   <Text style={S.changeLink}>Change</Text>
                 </TouchableOpacity>
               </View>
             </View>
           </View>
-
-          <View style={S.divider} />
-
-          {/* Test Alert */}
-          <TouchableOpacity style={S.testAlertRow} onPress={handleTestAlert} activeOpacity={0.7}>
-            <View style={S.rowIconWrap}>
-              <Ionicons name="flash-outline" size={18} color={Colors.mintDark} />
-            </View>
-            <View style={S.rowContent}>
-              <Text style={S.testAlertText}>Test Alert</Text>
-              <Text style={S.testAlertSub}>Tap to preview vibration & sound</Text>
-            </View>
-            <Ionicons name="chevron-forward" size={18} color={Colors.lightGray} />
-          </TouchableOpacity>
         </View>
 
-        {/* ── Notifications ─────────────────────────────────────────── */}
+        {/* ── Notifications Section ───────────────────────────────────── */}
         <Text style={S.sectionLabel}>Notifications</Text>
+
+        {/* Master Toggle Card */}
         <View style={S.card}>
-          <View style={S.row}>
-            <View style={S.rowIconWrap}>
-              <Ionicons name="notifications-outline" size={18} color={Colors.mintDark} />
-            </View>
-            <View style={[S.rowContent, { flex: 1 }]}>
-              <Text style={S.rowLabel}>Push Notifications</Text>
-              <Text style={S.rowValue}>{notifEnabled ? 'Enabled' : 'Disabled'}</Text>
-            </View>
+          <View style={[S.rowBetween, S.rowLast]}>
+            <Text style={S.rowLabelBold}>Enable all Notifications</Text>
             <Switch
-              value={notifEnabled}
-              onValueChange={handleNotifToggle}
-              trackColor={{ false: Colors.separator, true: Colors.mint }}
+              value={masterAlertsEnabled}
+              onValueChange={handleMasterAlertsToggle}
+              trackColor={{ false: Colors.separator, true: Colors.mintDark }}
               thumbColor={Colors.white}
               ios_backgroundColor={Colors.separator}
-              disabled={saving}
             />
           </View>
         </View>
 
-        {saving && (
-          <View style={{ flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-            <ActivityIndicator size="small" color={Colors.mintDark} />
-            <Text style={{ fontSize: 13, color: Colors.medGray }}>Saving…</Text>
+        {/* Sub-notifications Card (visible when master enabled) */}
+        {masterAlertsEnabled && (
+          <View style={[S.card, { marginTop: 16 }]}>
+            {/* Pickup Notification */}
+            <View style={S.rowColumn}>
+              <View style={S.rowTopBetween}>
+                <Text style={S.rowLabelBold}>Pickup Notification</Text>
+                <Switch
+                  value={boardingAlertStopId !== null}
+                  onValueChange={handleBoardingAlertToggle}
+                  trackColor={{ false: Colors.separator, true: Colors.mintDark }}
+                  thumbColor={Colors.white}
+                  ios_backgroundColor={Colors.separator}
+                  disabled={saving}
+                />
+              </View>
+              <View style={S.valueWithAction}>
+                <Text style={S.rowValue}>
+                  {boardingAlertStopId
+                    ? (stops.find(s => s.id === boardingAlertStopId)?.name || 'Not set')
+                    : 'Not Set'}
+                </Text>
+                <TouchableOpacity
+                  onPress={() => {
+                    registerForPushNotificationsAsync().catch(() => {});
+                    setBoardingAlertEdit(true);
+                  }}
+                  disabled={saving}
+                  activeOpacity={0.7}
+                >
+                  <Text style={S.changeLink}>Change</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Drop-off Notification */}
+            <View style={S.rowColumn}>
+              <View style={S.rowTopBetween}>
+                <Text style={S.rowLabelBold}>Drop-off Notification</Text>
+                <Switch
+                  value={destinationAlertStopId !== null}
+                  onValueChange={handleDestinationAlertToggle}
+                  trackColor={{ false: Colors.separator, true: Colors.mintDark }}
+                  thumbColor={Colors.white}
+                  ios_backgroundColor={Colors.separator}
+                  disabled={saving}
+                />
+              </View>
+              <View style={S.valueWithAction}>
+                <Text style={S.rowValue}>
+                  {destinationAlertStopId
+                    ? (stops.find(s => s.id === destinationAlertStopId)?.name || 'Not set')
+                    : 'Not Set'}
+                </Text>
+                <TouchableOpacity
+                  onPress={() => {
+                    registerForPushNotificationsAsync().catch(() => {});
+                    setDestinationAlertEdit(true);
+                  }}
+                  disabled={saving}
+                  activeOpacity={0.7}
+                >
+                  <Text style={S.changeLink}>Change</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Trip Started */}
+            <View style={S.rowBetween}>
+              <View style={S.rowTextGroup}>
+                <Text style={S.rowLabelBold}>Trip Started</Text>
+                <Text style={S.descText}>When the bus begins its journey</Text>
+              </View>
+              <Switch
+                value={notifyTripStarted}
+                onValueChange={val => handleNotifyToggle('notify_trip_started', val, setNotifyTripStarted)}
+                trackColor={{ false: Colors.separator, true: Colors.mintDark }}
+                thumbColor={Colors.white}
+                ios_backgroundColor={Colors.separator}
+                disabled={savingNotif}
+              />
+            </View>
+
+            {/* Delay Notification */}
+            <View style={S.rowBetween}>
+              <View style={S.rowTextGroup}>
+                <Text style={S.rowLabelBold}>Delay Notification</Text>
+                <Text style={S.descText}>When your bus is running late</Text>
+              </View>
+              <Switch
+                value={notifyDelays}
+                onValueChange={val => handleNotifyToggle('notify_delays', val, setNotifyDelays)}
+                trackColor={{ false: Colors.separator, true: Colors.mintDark }}
+                thumbColor={Colors.white}
+                ios_backgroundColor={Colors.separator}
+                disabled={savingNotif}
+              />
+            </View>
+
+            {/* General Announcements */}
+            <View style={S.rowBetween}>
+              <View style={S.rowTextGroup}>
+                <Text style={S.rowLabelBold}>General Announcements</Text>
+                <Text style={S.descText}>University broadcasts from admin</Text>
+              </View>
+              <Switch
+                value={notifyAdminBroadcasts}
+                onValueChange={val => handleNotifyToggle('notify_admin_broadcasts', val, setNotifyAdminBroadcasts)}
+                trackColor={{ false: Colors.separator, true: Colors.mintDark }}
+                thumbColor={Colors.white}
+                ios_backgroundColor={Colors.separator}
+                disabled={savingNotif}
+              />
+            </View>
+
+            {/* Vibrate on Notification */}
+            <View style={S.rowBetween}>
+              <Text style={S.rowLabelBold}>Vibrate on Notification</Text>
+              <Switch
+                value={vibrateEnabled}
+                onValueChange={handleVibrateToggle}
+                trackColor={{ false: Colors.separator, true: Colors.mintDark }}
+                thumbColor={Colors.white}
+                ios_backgroundColor={Colors.separator}
+              />
+            </View>
+
+            {/* Sound on Notification */}
+            <View style={[S.rowBetween, !soundEnabled && S.rowLast]}>
+              <Text style={S.rowLabelBold}>Sound on Notification</Text>
+              <Switch
+                value={soundEnabled}
+                onValueChange={handleSoundToggle}
+                trackColor={{ false: Colors.separator, true: Colors.mintDark }}
+                thumbColor={Colors.white}
+                ios_backgroundColor={Colors.separator}
+              />
+            </View>
+
+            {/* Notification Sound Selection */}
+            {soundEnabled && (
+              <View style={[S.rowBetween, S.rowLast]}>
+                <View style={S.rowTextGroup}>
+                  <Text style={S.rowLabelBold}>Notification Sound</Text>
+                  <Text style={S.descText}>
+                    {ALARM_TONE_OPTIONS.find(o => o.value === alarmTone)?.label || 'Default'}
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  onPress={() => setAlarmToneEdit(true)}
+                  activeOpacity={0.7}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <Text style={S.changeLink}>Change</Text>
+                </TouchableOpacity>
+              </View>
+            )}
           </View>
         )}
 
-        {/* Version */}
-        <Text style={S.versionText}>DUK Bus Tracker v1.0 Android</Text>
+        {(saving || savingNotif) && (
+          <View style={S.savingIndicator}>
+            <ActivityIndicator size="small" color={Colors.mintDark} />
+            <Text style={S.savingText}>Saving…</Text>
+          </View>
+        )}
 
-        {/* Logout */}
-        <TouchableOpacity style={S.logoutRow} onPress={handleLogout} activeOpacity={0.7}>
-          <Ionicons name="log-out-outline" size={18} color={Colors.medGray} />
+        {/* Version Info */}
+        <Text style={S.versionText}>Version 1.0.0 Android</Text>
+
+        {/* Log Out Button (subtle, text-based) */}
+        <TouchableOpacity style={S.logoutBtn} onPress={handleLogout} activeOpacity={0.7}>
+          <Ionicons name="log-out-outline" size={18} color="#888" />
           <Text style={S.logoutText}>Log Out</Text>
         </TouchableOpacity>
-
       </ScrollView>
 
-      {/* ── Stop-Select Modals ──────────────────────────────────────── */}
+      {/* ── Stop Selection Modals ────────────────────────────────────── */}
       <StopSelectModal
         visible={boardingEdit}
         title="Select Boarding Stop"
@@ -598,7 +752,7 @@ export default function SettingsScreen({ navigation }: any) {
       />
       <StopSelectModal
         visible={boardingAlertEdit}
-        title="Select Boarding Alert Stop"
+        title="Choose stop where you need to get alert"
         stops={stops}
         selectedStopId={boardingAlertStopId}
         onSelect={handleBoardingAlertChange}
@@ -606,7 +760,7 @@ export default function SettingsScreen({ navigation }: any) {
       />
       <StopSelectModal
         visible={destinationAlertEdit}
-        title="Select Destination Alert Stop"
+        title="Choose stop where you need to get alert"
         stops={stops}
         selectedStopId={destinationAlertStopId}
         onSelect={handleDestinationAlertChange}
@@ -622,57 +776,249 @@ export default function SettingsScreen({ navigation }: any) {
   );
 }
 
-// ── Alarm Tone Picker Styles ─────────────────────────────────────────────────
+// ── Alarm Tone Modal Styles ──────────────────────────────────────────────────
 const AT = StyleSheet.create({
-  toneIconWrap:       { width: 32, height: 32, borderRadius: 16, backgroundColor: Colors.bgGray, alignItems: 'center', justifyContent: 'center' },
-  toneIconWrapActive: { backgroundColor: Colors.mintLighter },
-  toneDesc:           { fontSize: 12, color: Colors.lightGray, marginTop: 2 },
+  toneIconWrap: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: Colors.bgGray,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  toneIconWrapActive: {
+    backgroundColor: Colors.mintLighter,
+  },
+  toneDesc: {
+    fontSize: 13,
+    color: Colors.medGray,
+    marginTop: 2,
+  },
 });
 
-// ── Stop Modal Styles ────────────────────────────────────────────────────────
+// ── Stop Modal Styles (matches duk_pwa1 StopSelectModal) ─────────────────────
 const M = StyleSheet.create({
-  overlay:         { flex: 1, justifyContent: 'flex-end' },
-  backdrop:        { ...StyleSheet.absoluteFill as any, backgroundColor: 'rgba(0,0,0,0.45)' },
-  sheet:           { backgroundColor: Colors.white, borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '75%', paddingBottom: 0, shadowColor: '#000', shadowOffset: { width: 0, height: -4 }, shadowOpacity: 0.12, shadowRadius: 20, elevation: 20 },
-  handle:          { width: 36, height: 4, borderRadius: 2, backgroundColor: Colors.separator, alignSelf: 'center', marginTop: 10, marginBottom: 4 },
-  sheetHeader:     { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: Colors.separator },
-  sheetTitle:      { fontSize: 17, fontWeight: '700', color: Colors.black },
-  closeBtn:        { padding: 4 },
-  stopItem:        { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 14, paddingHorizontal: 20, borderRadius: 12, marginHorizontal: 8, marginVertical: 2 },
-  stopItemActive:  { backgroundColor: Colors.mintLighter },
-  stopItemText:    { fontSize: 15, fontWeight: '500', color: Colors.black },
-  stopItemTextActive: { fontWeight: '700', color: Colors.mintText },
+  overlay: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.45)',
+  },
+  backdrop: {
+    ...(StyleSheet.absoluteFill as any),
+  },
+  card: {
+    width: '90%',
+    maxWidth: 400,
+    maxHeight: '80%',
+    backgroundColor: Colors.white,
+    borderRadius: 28,
+    padding: 24,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.12,
+    shadowRadius: 32,
+    elevation: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.9)',
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 16,
+  },
+  title: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: Colors.black,
+    flex: 1,
+    paddingRight: 8,
+  },
+  closeBtn: {
+    padding: 4,
+  },
+  stopItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderRadius: 14,
+    marginVertical: 4,
+    backgroundColor: Colors.bgGray,
+  },
+  stopItemActive: {
+    backgroundColor: Colors.mintLighter,
+  },
+  stopItemText: {
+    fontSize: 16,
+    fontWeight: '500',
+    color: Colors.black,
+    flex: 1,
+  },
+  stopItemTextActive: {
+    fontWeight: '700',
+    color: Colors.mintText,
+  },
 });
 
-// ── Main Styles — consistent with RouteView card styling ─────────────────────
+// ── Screen Styles (aligned pixel-for-pixel with duk_pwa1 liquid-glass) ───────
 const S = StyleSheet.create({
-  safeArea:      { flex: 1, backgroundColor: Colors.bgGray },
-  scrollContent: { paddingHorizontal: 20, paddingTop: 20, paddingBottom: 20 },
-  screenTitle:   { fontSize: 24, fontWeight: '800', color: Colors.black, marginBottom: 20, marginTop: 4, letterSpacing: -0.5 },
+  safeArea: {
+    flex: 1,
+    backgroundColor: Colors.bgGray,
+  },
+  scrollContent: {
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 120,
+  },
+  screenTitle: {
+    fontSize: 28,
+    fontWeight: '800',
+    color: Colors.black,
+    marginBottom: 24,
+    marginTop: 4,
+  },
 
-  // Section label — matches RouteView sectionTitle style
-  sectionLabel:  { fontSize: 13, fontWeight: '700', color: Colors.medGray, letterSpacing: 0.5, textTransform: 'uppercase', marginBottom: 8, marginLeft: 4, marginTop: 4 },
+  // Section label — 13px uppercase bold tracking
+  sectionLabel: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: Colors.medGray,
+    letterSpacing: 0.8,
+    textTransform: 'uppercase',
+    marginBottom: 8,
+    marginLeft: 4,
+  },
 
-  // Card — matches RouteView timeline card: borderRadius 20, same shadow
-  card:          { backgroundColor: Colors.white, borderRadius: 20, paddingHorizontal: 16, paddingVertical: 4, marginBottom: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.05, shadowRadius: 16, elevation: 3 },
+  // Card — 24px radius, liquid-glass elevation & border
+  card: {
+    backgroundColor: Colors.white,
+    borderRadius: 24,
+    paddingHorizontal: 20,
+    paddingVertical: 6,
+    marginBottom: 24,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.9)',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.04,
+    shadowRadius: 16,
+    elevation: 2,
+  },
 
   // Rows
-  row:           { flexDirection: 'row', paddingVertical: 14, alignItems: 'center' },
-  rowIconWrap:   { width: 34, height: 34, borderRadius: 12, backgroundColor: Colors.mintLighter, alignItems: 'center', justifyContent: 'center', marginRight: 12 },
-  rowContent:    { flex: 1 },
-  rowLabel:      { fontSize: 13, color: Colors.medGray, fontWeight: '500', marginBottom: 2 },
-  rowValue:      { fontSize: 16, fontWeight: '600', color: Colors.black },
-  changeLink:    { fontSize: 14, fontWeight: '600', color: Colors.mintDark, textDecorationLine: 'underline' },
+  row: {
+    paddingVertical: 15,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.separator,
+  },
+  rowLast: {
+    borderBottomWidth: 0,
+  },
+  rowContent: {
+    flex: 1,
+  },
+  rowLabel: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: Colors.black,
+    marginBottom: 3,
+  },
+  rowLabelBold: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: Colors.black,
+  },
+  rowValue: {
+    fontSize: 15,
+    fontWeight: '500',
+    color: Colors.medGray,
+  },
+  valueWithAction: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 2,
+  },
+  changeLink: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: Colors.mintDark,
+    textDecorationLine: 'underline',
+  },
 
-  divider:       { height: 1, backgroundColor: Colors.separator, marginHorizontal: -16 },
+  // Row between (e.g. Master toggle, Vibrate, Sound, etc.)
+  rowBetween: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 15,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.separator,
+  },
+  rowTextGroup: {
+    flex: 1,
+    paddingRight: 16,
+  },
+  descText: {
+    fontSize: 13,
+    color: Colors.medGray,
+    marginTop: 3,
+    lineHeight: 18,
+  },
 
-  // Test Alert row
-  testAlertRow:  { flexDirection: 'row', paddingVertical: 14, alignItems: 'center' },
-  testAlertText: { fontSize: 15, fontWeight: '700', color: Colors.mintDark },
-  testAlertSub:  { fontSize: 12, color: Colors.lightGray, marginTop: 2 },
+  // Proximity alerts column layout
+  rowColumn: {
+    paddingVertical: 15,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.separator,
+    gap: 3,
+  },
+  rowTopBetween: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    width: '100%',
+  },
 
-  // Logout
-  versionText:   { fontSize: 12, color: Colors.lightGray, textAlign: 'center', marginBottom: 8, marginTop: 8 },
-  logoutRow:     { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 16, marginTop: 4 },
-  logoutText:    { fontSize: 16, fontWeight: '600', color: Colors.medGray },
+  // Saving indicator
+  savingIndicator: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 8,
+    marginVertical: 12,
+  },
+  savingText: {
+    fontSize: 14,
+    color: Colors.medGray,
+  },
+
+  // Version
+  versionText: {
+    fontSize: 13,
+    color: '#aaa',
+    textAlign: 'center',
+    marginTop: 32,
+    marginBottom: -8,
+  },
+
+  // Logout button
+  logoutBtn: {
+    marginTop: 24,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingVertical: 12,
+    width: '100%',
+  },
+  logoutText: {
+    fontSize: 17,
+    fontWeight: '600',
+    color: '#888',
+  },
 });

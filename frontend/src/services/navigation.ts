@@ -4,7 +4,8 @@ export type RootStackParamList = {
   ProfileSetup: undefined;
   OtpVerify: { email: string; name: string; boardingPoint: any };
   RouteView: { name?: string; boardingPoint?: any };
-  MapFull: undefined;
+  Settings: undefined;
+  Help: undefined;
 };
 
 export const navigationRef = createNavigationContainerRef<RootStackParamList>();

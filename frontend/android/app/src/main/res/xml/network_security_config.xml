@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Allow cleartext (HTTP) for local dev -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <!-- Trust system CAs -->
+            <certificates src="system" />
+            <!-- Trust user-installed CAs (for self-signed certs) -->
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- Trust the DUK backend server even with a self-signed cert -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">103.156.188.62</domain>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </domain-config>
+</network-security-config>

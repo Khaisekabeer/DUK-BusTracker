@@ -1,21 +1,27 @@
 /**
  * api.ts — DUK Bus Tracker mobile API client.
- * All requests go to the FastAPI backend (port 5004).
+ * All requests go through Nginx on the production server,
+ * which proxies /api/* to the mega_gateway backend (port 8000).
  *
  * For local development with an Android emulator, use:
- *   http://10.0.2.2:5004   (emulator → laptop localhost)
+ *   http://10.0.2.2       (emulator → laptop localhost, nginx on port 80)
  * For a physical device on the same WiFi, use your laptop's local IP:
- *   http://192.168.x.x:5004
- * For the college server:
- *   http://103.156.188.51:5004
+ *   http://192.168.x.x
+ * For the production server:
+ *   http://103.156.188.62
  */
 
+ 
 import axios from 'axios';
-import { Platform } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 
-// const BASE_URL = 'https://duk-bustracker-production-e4f6.up.railway.app';
-const BASE_URL = 'http://10.143.83.17:5004';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { clearSession, getRefreshToken, saveToken, saveRefreshToken } from './storage';
+import { resetToLogin } from './navigation';
+
+import
+{API_BASE_URL } from '@env';
+
+const BASE_URL = API_BASE_URL || 'https://103.156.188.62';
 const api = axios.create({
   baseURL: BASE_URL,
   timeout: 30000,
@@ -31,26 +37,109 @@ api.interceptors.request.use(async (config) => {
   return config;
 });
 
+let isRefreshing = false;
+let failedQueue: any[] = [];
+
+const processQueue = (error: any, token: string | null = null) => {
+  failedQueue.forEach(prom => {
+    if (error) {
+      prom.reject(error);
+    } else {
+      prom.resolve(token);
+    }
+  });
+  failedQueue = [];
+};
+
+// ── Response Interceptor — handles 401 Unauthorized ────────────────────────
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config;
+
+    if (error.response && error.response.status === 401 && !originalRequest._retry) {
+      if (isRefreshing) {
+        return new Promise(function(resolve, reject) {
+          failedQueue.push({ resolve, reject });
+        }).then(token => {
+          originalRequest.headers.Authorization = 'Bearer ' + token;
+          return api(originalRequest);
+        }).catch(err => {
+          return Promise.reject(err);
+        });
+      }
+
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      const refreshToken = await getRefreshToken();
+      if (!refreshToken) {
+        isRefreshing = false;
+        await clearSession();
+        resetToLogin();
+        return Promise.reject(error);
+      }
+
+      try {
+        const { data } = await axios.post(`${BASE_URL}/api/v1/auth/refresh`, { refresh_token: refreshToken });
+        await saveToken(data.access_token);
+        if (data.refresh_token) {
+          await saveRefreshToken(data.refresh_token);
+        }
+        api.defaults.headers.common['Authorization'] = 'Bearer ' + data.access_token;
+        originalRequest.headers.Authorization = 'Bearer ' + data.access_token;
+        processQueue(null, data.access_token);
+        return api(originalRequest);
+      } catch (err) {
+        processQueue(err, null);
+        await clearSession();
+        resetToLogin();
+        return Promise.reject(err);
+      } finally {
+        isRefreshing = false;
+      }
+    }
+
+    return Promise.reject(error);
+  }
+);
+
 // ── Auth ───────────────────────────────────────────────────────────────────
 export const authApi = {
   /**
    * Step 1 — Submit name + @duk.ac.in email → backend sends OTP email.
    * Backend also accepts an optional boarding_stop_id to pre-populate profile.
    */
-  register: (name: string, email: string, boarding_stop_id?: number) =>
-    api.post('/auth/register', { name, email, boarding_stop_id }),
+  register: (name: string, email: string, boarding_stop_id?: number | null) =>
+    api.post('/api/v1/auth/register', { name, email, boarding_stop_id }),
+
+  googleLogin: (credential: string) =>
+    api.post('/api/v1/auth/google', { credential }),
 
   /**
    * Step 2 — Submit OTP code → returns JWT + user object on success.
    * Response: { access_token, token_type, user: { id, name, email, boarding_stop_id } }
    */
   verify: (email: string, otp: string) =>
-    api.post('/auth/verify', { email, otp }),
+    api.post('/api/v1/auth/verify', { email, otp }),
 
   /**
-   * Update proximity alert settings (requires JWT).
+   * Logs out the user from the backend by invalidating the token.
+   * Sends the refresh_token in the body so the server can revoke it.
+   */
+  logout: async () => {
+    const { getRefreshToken } = await import('./storage');
+    const refreshToken = await getRefreshToken();
+    return api.post('/api/v1/auth/logout', refreshToken ? { refresh_token: refreshToken } : undefined);
+  },
+
+  /**
+   * Update user preferences (requires JWT).
+   * Accepts any combination of profile + notification fields.
    */
   updatePreferences: (prefs: {
+    boarding_stop_id?: number | null;
+    destination_stop_id?: number | null;
     proximity_alert_enabled?: boolean;
     proximity_alert_type?: string;
     proximity_alert_value?: number;
@@ -58,13 +147,16 @@ export const authApi = {
     notifications_on?: boolean;
     boarding_alert_stop_id?: number | null;
     destination_alert_stop_id?: number | null;
-  }) => api.patch('/auth/preferences', prefs),
+    notify_trip_started?: boolean;
+    notify_delays?: boolean;
+    notify_admin_broadcasts?: boolean;
+  }) => api.patch('/api/v1/auth/preferences', prefs),
 
   updateDeviceToken: (deviceToken: string, notificationsOn: boolean = true) =>
-    api.put('/auth/device-token', { device_token: deviceToken, notifications_on: notificationsOn }),
+    api.put('/api/v1/auth/device-token', { device_token: deviceToken, notifications_on: notificationsOn }),
 
   getMyNotifications: () => 
-    api.get('/auth/me/notifications'),
+    api.get('/api/v1/notifications'),
 };
 
 // ── Tracking ───────────────────────────────────────────────────────────────
@@ -85,17 +177,19 @@ export const trackingApi = {
    */
   getTripState: () => api.get('/api/v1/trip_state'),
 
-  /**
-   * Today's visited stops and arrival times for the current session.
-   * Response: { visitedStops: { stopName: true }, arrivalTimes: { stopName: "9:15 AM" } }
-   */
-  getRouteHistory: () => api.get('/api/v1/route_history'),
+  getRouteHistory: (tripId?: number | null) => 
+    api.get(`/api/v1/route_history${tripId ? `?trip_id=${tripId}` : ''}`),
 
   /**
    * ML-predicted ETA to a specific bus stop.
    * Response: { stop_id, stop_name, eta_minutes, confidence, status }
    */
   getEta: (stop_id: number) => api.get('/api/v1/eta', { params: { stop_id } }),
+
+  /**
+   * All ML-predicted ETAs
+   */
+  getAllEtas: () => api.get('/api/v1/eta/all'),
 
   /**
    * GPS breadcrumb trail for a specific date (YYYY-MM-DD).
@@ -116,15 +210,33 @@ export const trackingApi = {
   getRouteSegment: (lat1: number, lon1: number, lat2: number, lon2: number) =>
     api.get(`/api/v1/route_segment?lat1=${lat1}&lon1=${lon1}&lat2=${lat2}&lon2=${lon2}`),
 
-  /**
-   * Complete route geometry
-   */
-  getRouteGeometry: () => api.get('/api/v1/route_geometry'),
+  getRouteGeometry: (tripId?: number | null, direction?: string | null) => {
+    const params = new URLSearchParams();
+    if (tripId) params.append('trip_id', tripId.toString());
+    if (direction) params.append('direction', direction);
+    params.append('t', Date.now().toString());
+    return api.get(`/api/v1/route_geometry?${params.toString()}`);
+  },
 
   /**
    * Snap arbitrary GPS points to road coordinates via OSRM.
    */
   snapRoute: (points: any[]) => api.post('/api/v1/snap_route', { points }),
+
+  /**
+   * Current trip's snapped GPS trail — the blue "where the bus has been" line.
+   * Response: { coordinates: [[lon, lat], ...], trip_status, started_at, ended_at }
+   */
+  getCurrentTrace: () => api.get('/api/v1/current_trace'),
+
+  /**
+   * Builds the WebSocket endpoint from the configured backend base URL.
+   */
+  getWsUrl: async () => {
+    const token = await AsyncStorage.getItem('jwt_token');
+    const wsBase = BASE_URL.replace(/^http/, 'ws');
+    return `${wsBase}/api/v1/ws/bus${token ? `?token=${token}` : ''}`;
+  },
 };
 
 

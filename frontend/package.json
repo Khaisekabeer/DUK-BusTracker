@@ -7,13 +7,14 @@
     "ios": "react-native run-ios",
     "lint": "eslint .",
     "start": "react-native start",
-    "test": "jest"
+    "test": "node --test __tests__/tracking_and_trail.test.mjs"
   },
   "dependencies": {
     "@maplibre/maplibre-react-native": "^11.3.6",
     "@react-native-async-storage/async-storage": "^3.1.1",
     "@react-native-firebase/app": "^26.2.0",
     "@react-native-firebase/messaging": "^26.2.0",
+    "@react-native-google-signin/google-signin": "^16.1.5",
     "@react-native-vector-icons/ionicons": "^13.1.2",
     "@react-native/new-app-screen": "0.86.0",
     "@react-navigation/native": "^7.3.14",
@@ -23,9 +24,12 @@
     "react": "19.2.3",
     "react-native": "0.86.0",
     "react-native-bootsplash": "^7.3.2",
+    "react-native-dotenv": "^5.0.0",
     "react-native-safe-area-context": "^5.5.2",
     "react-native-screens": "^4.26.2",
-    "react-native-vector-icons": "^10.3.0"
+    "react-native-sound": "^0.13.0",
+    "react-native-vector-icons": "^10.3.0",
+    "source-map": "^0.8.0"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",

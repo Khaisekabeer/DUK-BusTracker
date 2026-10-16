@@ -1,14 +1,15 @@
 /**
  * RouteViewScreen.tsx
- * Home screen — shows:
- *  - "Route View" heading with LIVE badge
- *  - Trip pill (Trip 1 → DESTINATION)
- *  - Stats row: Next stop ETA | ETA to destination | Stops done
- *  - Stop timeline (visited + upcoming)
- *  - Live Map thumbnail that opens MapFullScreen on tap
+ * Unified home screen with a top toggle bar to switch between:
+ *   - "Route View" → Stop timeline (scrollable list of stops with arrival data)
+ *   - "Map View"   → Full interactive map with bus tracking
+ *
+ * Mirrors the PWA duk_pwa1 RouteView.jsx layout:
+ *   TopBar → Header + Stats → Toggle Bar → [Route Timeline | Map]
  */
 
 import React, { useEffect, useState, useRef, useCallback } from 'react';
+import { useFocusEffect } from '@react-navigation/native';
 import {
   View,
   Text,
@@ -20,6 +21,9 @@ import {
   TouchableOpacity,
   Animated,
   Easing,
+  Dimensions,
+  PermissionsAndroid,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Ionicons from '@react-native-vector-icons/ionicons';
@@ -30,34 +34,48 @@ import {
   Layer,
   Marker,
 } from '@maplibre/maplibre-react-native';
+// @ts-ignore
+import messaging from '@react-native-firebase/messaging';
 import Colors from '../theme/colors';
 import TopBar from '../components/TopBar';
 import BusIdleAnimation from '../components/BusIdleAnimation';
-import { trackingApi } from '../services/api';
+import { trackingApi, authApi } from '../services/api';
 import { getUser } from '../services/storage';
 import { haversineDistKm } from '../utils/math';
+import { registerForPushNotificationsAsync, registerForegroundHandler } from '../services/firebaseService';
+import GPSAnimator from '../utils/gpsAnimator';
+import TrailManager from '../utils/trailManager';
+
 
 const MAP_STYLE    = 'https://tiles.openfreemap.org/styles/liberty';
 // Geographic center of Thiruvananthapuram city — used as fallback before any data loads
 const DEFAULT_CENTER: [number, number] = [76.9366, 8.5241];
 const DEFAULT_ZOOM   = 12;
 const POLL_MS        = 30_000;
-// Height per timeline row × 6 visible rows + card padding
-const TIMELINE_VISIBLE_HEIGHT = 56 * 6 + 40;
 
 function todayStr() { return new Date().toISOString().split('T')[0]; }
 
-function getHaversineDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371; // Earth's radius in km
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLon = (lon2 - lon1) * Math.PI / 180;
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-    Math.sin(dLon / 2) * Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
+/**
+ * Override geocoded location_name with the closest bus stop name
+ * if the bus is within 200m (0.2km) of any known stop.
+ * Mirrors PWA duk_pwa1 useBusTracking.js getProximityLocationName.
+ */
+function getProximityLocationName(
+  lon: number, lat: number, defaultName: string | null, stops: any[]
+): string | null {
+  if (!stops || stops.length === 0) return defaultName;
+  let closestStop: any = null;
+  let minDist = Infinity;
+  for (const stop of stops) {
+    const dist = haversineDistKm(Number(stop.lat), Number(stop.lon), lat, lon);
+    if (dist < minDist) {
+      minDist = dist;
+      closestStop = stop;
+    }
+  }
+  return (minDist <= 0.2 && closestStop) ? closestStop.name : defaultName;
 }
+
 
 function formatLastUpdated(isoString: string) {
   const d = new Date(isoString);
@@ -65,53 +83,6 @@ function formatLastUpdated(isoString: string) {
 }
 
 // ── Daily Scheduled Timetables ───────────────────────────────────────────────
-const MORNING_SCHEDULE: Record<string, string> = {
-  'Central Polytechnic':          '07:30 AM',
-  'Vattiyoorkavu Jn':             '07:35 AM',
-  'Manjadimoodu':                 '07:38 AM',
-  'Maruthankuzhi':                '07:42 AM',
-  'Sasthamangalam':               '07:47 AM',
-  'Vellayambalam':                '07:52 AM',
-  'Thampanoor':                   '08:00 AM',
-  'Chandrasekharan Nair Stadium': '08:08 AM',
-  'PMG':                          '08:12 AM',
-  'Pattom':                       '08:16 AM',
-  'Kesavadasapuram':              '08:22 AM',
-  'Ulloor':                       '08:27 AM',
-  'Pongumoodu':                   '08:32 AM',
-  'Sreekaryam':                   '08:37 AM',
-  'Chavadimukku':                 '08:42 AM',
-  'Karyavattom':                  '08:48 AM',
-  'IIITMK':                       '08:52 AM',
-  'Technopark Front':             '08:56 AM',
-  'Kazhakuttam':                  '09:02 AM',
-  'Pallipuram':                   '09:12 AM',
-  'Digital University Kerala':    '09:20 AM',
-};
-
-const EVENING_SCHEDULE: Record<string, string> = {
-  'Digital University Kerala':    '05:40 PM',
-  'Pallipuram':                   '05:48 PM',
-  'Kazhakuttam':                  '05:58 PM',
-  'Technopark Front':             '06:04 PM',
-  'IIITMK':                       '06:08 PM',
-  'Karyavattom':                  '06:12 PM',
-  'Chavadimukku':                 '06:18 PM',
-  'Sreekaryam':                   '06:23 PM',
-  'Pongumoodu':                   '06:28 PM',
-  'Ulloor':                       '06:33 PM',
-  'Kesavadasapuram':              '06:38 PM',
-  'Pattom':                       '06:44 PM',
-  'PMG':                          '06:48 PM',
-  'Chandrasekharan Nair Stadium': '06:52 PM',
-  'Thampanoor':                   '07:00 PM',
-  'Vellayambalam':                '07:08 PM',
-  'Sasthamangalam':               '07:13 PM',
-  'Maruthankuzhi':                '07:18 PM',
-  'Manjadimoodu':                 '07:22 PM',
-  'Vattiyoorkavu Jn':             '07:25 PM',
-  'Central Polytechnic':          '07:30 PM',
-};
 
 function parseTimeToMinutes(timeStr: string): number | null {
   if (!timeStr) return null;
@@ -163,25 +134,15 @@ function getDelayBadge(actualStr?: string | null, scheduledStr?: string | null, 
 }
 
 /**
- * Compute the map center + zoom for the mini-map thumbnail.
- *
- * Priority order:
- *  1. Bus live position (center on it tightly — zoom 13 so city area is clear)
- *  2. Computed center of all stop coordinates with auto-zoom to fit the route
- *  3. Hard-coded Thiruvananthapuram default
- *
- * Uses center+zoom (not `bounds`) so it works identically on iOS and Android.
+ * Compute the map center + zoom.
  */
 function getMapViewport(
   stops: any[],
   busCoord: [number, number] | null,
 ): { center: [number, number]; zoom: number } {
-  // 1. Bus is live — center on it, zoomed in enough to show the city
   if (busCoord) {
     return { center: busCoord, zoom: 13 };
   }
-
-  // 2. Stops loaded — compute bounding-box center + an appropriate zoom
   if (stops.length) {
     const lons = stops.map(s => Number(s.lon));
     const lats = stops.map(s => Number(s.lat));
@@ -199,26 +160,33 @@ function getMapViewport(
     else                 zoom = 13;
     return { center: [centerLon, centerLat], zoom };
   }
-
-  // 3. Nothing yet — show Thiruvananthapuram
   return { center: DEFAULT_CENTER, zoom: DEFAULT_ZOOM };
 }
 
 export default function RouteViewScreen({ route, navigation }: any) {
   const { boardingPoint } = route?.params ?? {};
 
+  // ── View mode toggle ──────────────────────────────────────────────────────
+  const [viewMode, setViewMode] = useState<'route' | 'map'>('route');
+
   const [user,         setUser]         = useState<any>(null);
   const [tripState,    setTripState]    = useState<any>(null);
   const [busPosition,  setBusPosition]  = useState<any>(null);
   const [routeHistory, setRouteHistory] = useState<any>(null);
   const [eta,          setEta]          = useState<any>(null);
+  const [mlEtas,       setMlEtas]       = useState<any>(null);
   const [plannedCoords, setPlannedCoords] = useState<[number, number][]>([]);
   const [trailCoords,  setTrailCoords]  = useState<[number, number][]>([]);
   const [animatedBus,  setAnimatedBus]  = useState<[number, number] | null>(null);
+  const [busBearing,   setBusBearing]   = useState<number>(0);
+  const [animDrawnPath, setAnimDrawnPath] = useState<[number, number][]>([]);
   const [stops,        setStops]        = useState<any[]>([]);
   const [loading,      setLoading]      = useState(true);
   const [refreshing,   setRefreshing]   = useState(false);
   const [error,        setError]        = useState('');
+  const [autoCenter,   setAutoCenter]   = useState(true);
+  const [displayLocationName, setDisplayLocationName] = useState<string | null>(null);
+  const [zoomLevel,    setZoomLevel]    = useState(DEFAULT_ZOOM);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const cameraRef   = useRef<any>(null);
@@ -226,72 +194,60 @@ export default function RouteViewScreen({ route, navigation }: any) {
   const animIntervalRef = useRef<any>(null);
   const currentPosRef = useRef<[number, number] | null>(null);
   const pulseAnim   = useRef(new Animated.Value(1)).current;
+  const mapRef      = useRef<any>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const isLiveRef = useRef<boolean>(false);
+  const animatorRef = useRef<GPSAnimator | null>(null);
+  const trailManagerRef = useRef<TrailManager | null>(null);
+  const timerRef = useRef<any>(null);
 
-  const animateBusTo = useCallback(async (targetLat: number, targetLon: number) => {
-    const startPos = currentPosRef.current || [targetLon, targetLat];
-    const [startLon, startLat] = startPos;
-    const distKm = haversineDistKm(startLon, startLat, targetLon, targetLat);
 
-    if (!currentPosRef.current || distKm > 8.0 || distKm < 0.0005) {
-      setAnimatedBus([targetLon, targetLat]);
-      currentPosRef.current = [targetLon, targetLat];
-      return;
-    }
-
-    let polyline = [[startLon, startLat], [targetLon, targetLat]];
-    try {
-      const seg = await trackingApi.getRouteSegment(startLat, startLon, targetLat, targetLon);
-      if (seg.data?.coordinates?.length > 1) polyline = seg.data.coordinates;
-    } catch (_) { }
-
-    const cumDists = [0];
-    for (let i = 1; i < polyline.length; i++) {
-      cumDists.push(cumDists[i - 1] + haversineDistKm(polyline[i - 1][0], polyline[i - 1][1], polyline[i][0], polyline[i][1]));
-    }
-    const totalDist = cumDists[cumDists.length - 1];
-
-    if (totalDist <= 0.00001) {
-      setAnimatedBus([targetLon, targetLat]);
-      currentPosRef.current = [targetLon, targetLat];
-      return;
-    }
-
-    if (animIntervalRef.current) cancelAnimationFrame(animIntervalRef.current);
-
-    const duration = 15000; // POLL_MS
-    const startTime = Date.now();
-
-    const step = () => {
-      let progress = (Date.now() - startTime) / duration;
-      if (progress > 1.0) progress = 1.0;
-
-      const currentDist = progress * totalDist;
-      let segIdx = 0;
-      while (segIdx < cumDists.length - 2 && cumDists[segIdx + 1] < currentDist) {
-        segIdx++;
+  
+  // Initialize Animator & Trail Manager
+  useEffect(() => {
+    trailManagerRef.current = new TrailManager();
+    animatorRef.current = new GPSAnimator({
+      onPositionUpdate: (point, drawnPath, bearing) => {
+        setAnimatedBus([point[0], point[1]]);
+        if (drawnPath) {
+          setAnimDrawnPath(drawnPath);
+        }
+        if (bearing !== undefined) {
+          setBusBearing(bearing);
+        }
+      },
+      onSegmentFinished: (path) => {
+        if (trailManagerRef.current) {
+          trailManagerRef.current.commitSegment(path);
+          setTrailCoords(trailManagerRef.current.getLiveTrail());
+          setAnimDrawnPath([]); // clear active animation path
+        }
+      },
+      segmentFetcher: async (lat1, lon1, lat2, lon2) => {
+        try {
+          const seg = await trackingApi.getRouteSegment(lat1, lon1, lat2, lon2);
+          if (seg.data?.coordinates?.length > 1) return seg.data.coordinates;
+        } catch (_) {}
+        return [];
       }
+    });
 
-      const p1 = polyline[segIdx];
-      const p2 = polyline[segIdx + 1];
-      const segSpan = (cumDists[segIdx + 1] - cumDists[segIdx]) || 0.00001;
-      const segFrac = Math.max(0, Math.min(1, (currentDist - cumDists[segIdx]) / segSpan));
-
-      const curLon = p1[0] + (p2[0] - p1[0]) * segFrac;
-      const curLat = p1[1] + (p2[1] - p1[1]) * segFrac;
-
-      setAnimatedBus([curLon, curLat]);
-      currentPosRef.current = [curLon, curLat];
-
-      if (progress < 1.0) {
-        animIntervalRef.current = requestAnimationFrame(step);
-      } else {
-        const finalPoint = polyline[polyline.length - 1];
-        setAnimatedBus(finalPoint as [number, number]);
-        currentPosRef.current = finalPoint as [number, number];
-      }
+    return () => {
+      animatorRef.current?.destroy();
+      trailManagerRef.current?.clear();
     };
+  }, []);
 
-    animIntervalRef.current = requestAnimationFrame(step);
+  useEffect(() => {
+    if (trailManagerRef.current && plannedCoords) {
+      trailManagerRef.current.setPlannedRoute(plannedCoords);
+    }
+  }, [plannedCoords]);
+
+  useEffect(() => {
+    registerForPushNotificationsAsync();
+    const unsubscribe = registerForegroundHandler();
+    return unsubscribe;
   }, []);
 
   useEffect(() => {
@@ -303,38 +259,67 @@ export default function RouteViewScreen({ route, navigation }: any) {
     ).start();
   }, [pulseAnim]);
 
-  useEffect(() => { getUser().then((u: any) => { if (u) setUser(u); }); }, []);
+  useFocusEffect(
+    useCallback(() => {
+      getUser().then((u: any) => { if (u) setUser(u); });
+    }, [])
+  );
 
   const fetchData = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true);
     setError('');
     try {
-      const [tripRes, busRes, historyRes, stopsRes, geoRes] = await Promise.allSettled([
-        trackingApi.getTripState(),
+      let trip: any = null;
+      try {
+        const tripRes = await trackingApi.getTripState();
+        trip = tripRes.data;
+      } catch (_) {}
+
+      const [busRes, historyRes, stopsRes, geoRes, traceRes, allEtasRes] = await Promise.allSettled([
         trackingApi.getLatest(),
-        trackingApi.getRouteHistory(),
+        trackingApi.getRouteHistory(trip?.trip_id),
         trackingApi.getStops(),
-        plannedCoords.length === 0 ? trackingApi.getRouteGeometry() : Promise.resolve(null),
+        plannedCoords.length === 0 ? trackingApi.getRouteGeometry(trip?.trip_id, trip?.direction) : Promise.resolve(null),
+        trackingApi.getCurrentTrace(),
+        trip && ['active', 'connecting', 'on_trip', 'late'].includes(trip.status) ? trackingApi.getAllEtas() : Promise.resolve(null),
       ]);
-      const trip = tripRes.status === 'fulfilled' ? tripRes.value?.data : null;
-      const bus = busRes.status === 'fulfilled' ? busRes.value?.data : null;
+
+      const rawBus = busRes.status === 'fulfilled' ? busRes.value?.data : null;
       const history = historyRes.status === 'fulfilled' ? historyRes.value?.data : null;
-      const fetchedStops = stopsRes.status === 'fulfilled' ? stopsRes.value?.data?.stops : null;
+      const fetchedStops = stopsRes.status === 'fulfilled' ? 
+        (Array.isArray(stopsRes.value?.data) ? stopsRes.value.data : stopsRes.value?.data?.stops) : null;
       const geo = geoRes.status === 'fulfilled' ? geoRes.value?.data : null;
+      const trace = traceRes.status === 'fulfilled' ? traceRes.value?.data : null;
+      const fetchedMlEtas = allEtasRes.status === 'fulfilled' ? allEtasRes.value?.data : null;
+
+      // Normalize backend field names: speed_kmh → speed, ist_time → server_time fallback
+      const bus = rawBus ? {
+        ...rawBus,
+        speed: rawBus.speed_kmh ?? rawBus.speed ?? null,
+        server_time: rawBus.ist_time ?? rawBus.server_time ?? null,
+      } : null;
 
       if (trip) setTripState(trip);
       if (bus && bus.lat && bus.lon) {
         setBusPosition(bus);
-        animateBusTo(bus.lat, bus.lon);
+        animatorRef.current?.pushPoint(bus.lat, bus.lon, bus.server_time);
+        // Proximity location name override (matches PWA logic)
+        const resolvedName = fetchedStops && fetchedStops.length > 0
+          ? getProximityLocationName(bus.lon, bus.lat, bus.location_name || null, fetchedStops)
+          : bus.location_name || null;
+        if (resolvedName) setDisplayLocationName(resolvedName);
       }
       if (history) {
         setRouteHistory(history);
-        if (history.coords) {
-          setTrailCoords(history.coords.map((c: any) => [c.lon, c.lat]));
-        }
+      }
+      // Trail line: use the snapped GPS trail from /current_trace
+      if (trace?.coordinates?.length > 1) {
+        setTrailCoords(trace.coordinates);
       }
       if (fetchedStops) setStops(fetchedStops);
       if (geo?.coordinates) setPlannedCoords(geo.coordinates);
+      if (fetchedMlEtas) setMlEtas(fetchedMlEtas);
+      else setMlEtas(null);
 
       const stopId = user?.boarding_stop_id ?? boardingPoint?.id;
       if (stopId && bus?.is_live) {
@@ -347,16 +332,75 @@ export default function RouteViewScreen({ route, navigation }: any) {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [user, boardingPoint, animateBusTo, plannedCoords.length]);
+  }, [user, boardingPoint, plannedCoords.length]);
+
+  const _rescheduleInterval = useCallback((light: boolean) => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    const ms = light ? 30000 : 15000;
+    timerRef.current = setInterval(() => fetchData(false), ms);
+  }, [fetchData]);
 
   useEffect(() => {
-    fetchData();
-    intervalRef.current = setInterval(() => fetchData(), 15000);
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-      if (animIntervalRef.current) cancelAnimationFrame(animIntervalRef.current);
+    _rescheduleInterval(false);
+    let isMounted = true;
+    let reconnectTimeout: any = null;
+
+    const connectWs = async () => {
+      const wsUrl = await trackingApi.getWsUrl();
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (isMounted && !isLiveRef.current) {
+          isLiveRef.current = true;
+          _rescheduleInterval(true);
+        }
+      };
+
+      ws.onmessage = (e) => {
+        if (!isMounted) return;
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'gps' && animatorRef.current) {
+            animatorRef.current.pushPoint(msg.data.lat, msg.data.lon, msg.data.server_time ?? msg.data.ist_time);
+            // Proximity location name override for WebSocket updates
+            const wsLocName = getProximityLocationName(
+              msg.data.lon, msg.data.lat,
+              msg.data.location_name || null,
+              stops
+            );
+            if (wsLocName) setDisplayLocationName(wsLocName);
+            if (msg.data.speed !== undefined || msg.data.speed_kmh !== undefined) { msg.data.speed = msg.data.speed ?? msg.data.speed_kmh;
+              setBusPosition((prev: any) => prev ? { ...prev, ...msg.data } : msg.data);
+            }
+          } else if (msg.type === 'trip_status') {
+            fetchData(false); // fast re-fetch on status change
+          }
+        } catch (_) {}
+      };
+
+      ws.onclose = () => {
+        if (!isMounted) return;
+        isLiveRef.current = false;
+        _rescheduleInterval(false);
+        reconnectTimeout = setTimeout(connectWs, 5000);
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
     };
-  }, [fetchData]);
+
+    connectWs();
+    fetchData(true);
+
+    return () => {
+      isMounted = false;
+      if (timerRef.current) clearInterval(timerRef.current);
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (wsRef.current) wsRef.current.close();
+    };
+  }, [fetchData, _rescheduleInterval]);
 
   // Derived values
   const status        = tripState?.status || 'offline';
@@ -374,11 +418,11 @@ export default function RouteViewScreen({ route, navigation }: any) {
 
   function getSubtextStatus(): string {
     if (isIdleMode) {
-      if (status === 'cancelled') return 'Trip cancelled';
-      if (isUnscheduled) return 'Bus is active off-schedule (See Live Map)';
+      if (status === 'cancelled') return `Trip cancelled${tripState?.cancellation_reason ? ` (${tripState.cancellation_reason})` : ''}`;
+      if (isUnscheduled) return 'Bus is active off-schedule';
       return nextTripTime ? `Next trip at ${nextTripTime}` : 'Bus is offline';
     }
-    if (status === 'connecting') return 'Connecting to bus...';
+    if (status === 'connecting') return 'Connecting ...';
     
     let sub = `${tripName || 'Active Trip'} → ${destination}`;
     if (tripState?.late_by_minutes > 0) sub += ` • Delayed by ${tripState.late_by_minutes} mins`;
@@ -387,59 +431,96 @@ export default function RouteViewScreen({ route, navigation }: any) {
     return sub;
   }
 
-  const trailGeoJSON = { type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: trailCoords }, properties: {} };
-  const plannedGeoJSON = { type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: plannedCoords }, properties: {} };
+  const liveTrail = trailManagerRef.current?.getLiveTrail(animDrawnPath) || [];
+  const finalTrail = liveTrail.length > 0 ? liveTrail : trailCoords;
+  const createLineStringGeoJSON = (coords: any[]) => {
+    if (!coords || coords.length < 2) return { type: 'FeatureCollection' as const, features: [] };
+    return { type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: coords }, properties: {} };
+  };
 
-  const visitedMap: Record<string, string> = routeHistory?.arrivalTimes || {};
-  const visitedNames = new Set<string>(Object.keys(routeHistory?.visitedStops || {}));
+  const trailGeoJSON = createLineStringGeoJSON(isIdleMode ? [] : finalTrail);
+  const plannedGeoJSON = createLineStringGeoJSON(isIdleMode ? [] : plannedCoords);
+
+  const showHistory = isLive || status === 'completed' || status === 'on_trip' || status === 'connecting';
+  const isValidTrip = showHistory && tripState?.trip_id;
+  const visitedMap: Record<string, string> = isValidTrip ? (routeHistory?.arrivalTimes || {}) : {};
+  const visitedNames = new Set<string>(Object.keys(isValidTrip ? (routeHistory?.visitedStops || {}) : {}));
 
   const globalDelay = tripState?.late_by_minutes ?? 0;
-  const displayStops = isEvening ? [...stops].reverse() : stops;
+  const displayStops = (() => {
+    const filtered = stops.filter((s: any) => isEvening ? !!s.evening_time : !!s.morning_time);
+    return isEvening
+      ? [...filtered].sort((a, b) => (parseTimeToMinutes(a.evening_time) || 0) - (parseTimeToMinutes(b.evening_time) || 0))
+      : [...filtered].sort((a, b) => (parseTimeToMinutes(a.morning_time) || 0) - (parseTimeToMinutes(b.morning_time) || 0));
+  })();
   
   // The current stop is the first stop in the display order that has NOT been visited yet
   const currentStopIndex = displayStops.findIndex((s: any) => !visitedNames.has(s.name));
   const currentStopName = currentStopIndex !== -1 ? displayStops[currentStopIndex].name : null;
 
   const etaText = (() => {
-    if (!eta || !isOnline) return '—';
+    if (!eta || !isOnline || status === 'connecting') return '—';
     if (eta.status === 'passed' || eta.status === 'deviated') return '—';
     if (eta.eta_minutes != null) return `${Math.round(eta.eta_minutes)} min`;
     return '—';
   })();
-  
-  const doneCount   = visitedNames.size;
-  const totalCount  = stops.length || 21;
+
 
   useEffect(() => {
+    if (viewMode !== 'route') return;
     if (currentStopIndex > 0 && scrollViewRef.current) {
-      const offset = (currentStopIndex - 1) * 54;
-      scrollViewRef.current.scrollTo({ y: Math.max(0, offset), animated: true });
+      // Center the current stop in view: offset by 2 rows above it
+      const offset = Math.max(0, (currentStopIndex - 2) * 54);
+      scrollViewRef.current.scrollTo({ y: offset, animated: true });
     }
-  }, [currentStopIndex]);
+  }, [currentStopIndex, viewMode, busPosition]);
 
   const mapVp = getMapViewport(displayStops, animatedBus || null);
+
+  // Auto-center map on bus when in map view
   useEffect(() => {
-    if (cameraRef.current && mapVp.center) {
-      cameraRef.current.easeTo({
-        center: mapVp.center,
-        zoom: mapVp.zoom,
-        duration: 800,
-      });
+    if (viewMode === 'map' && autoCenter && animatedBus && cameraRef.current) {
+      cameraRef.current.easeTo?.({ center: animatedBus, zoom: zoomLevel, duration: 600 });
     }
-  }, [mapVp.center[0], mapVp.center[1], mapVp.zoom]);
+  }, [animatedBus, autoCenter, viewMode]);
+
+  // Map controls
+  const recenter = () => {
+    if (animatedBus) {
+      setZoomLevel(14);
+      cameraRef.current?.easeTo?.({ center: animatedBus, zoom: 14, duration: 600 });
+      setAutoCenter(true);
+    } else if (stops.length) {
+      const vp = getMapViewport(stops, null);
+      setZoomLevel(vp.zoom);
+      cameraRef.current?.easeTo?.({ center: vp.center, zoom: vp.zoom, duration: 600 });
+    }
+  };
+
+  const handleZoomIn = () => {
+    const newZoom = Math.min(zoomLevel + 1, 20);
+    setZoomLevel(newZoom);
+    cameraRef.current?.zoomTo?.(newZoom, { duration: 300 });
+  };
+
+  const handleZoomOut = () => {
+    const newZoom = Math.max(zoomLevel - 1, 3);
+    setZoomLevel(newZoom);
+    cameraRef.current?.zoomTo?.(newZoom, { duration: 300 });
+  };
 
   const timeline = displayStops.map((stop: any, idx: number) => {
     const isVisited = visitedNames.has(stop.name);
     const isCurrent = stop.name === currentStopName;
     const isMissed  = !isVisited && currentStopIndex > -1 && idx < currentStopIndex;
     const actualArrival = visitedMap[stop.name] ?? null;
-    const scheduledDaily = stop.scheduled_time ?? (isEvening ? EVENING_SCHEDULE[stop.name] : MORNING_SCHEDULE[stop.name]) ?? (isEvening ? '06:00 PM' : '08:00 AM');
+    const scheduledDaily = stop.scheduled_time ?? (isEvening ? stop.evening_time : stop.morning_time) ?? (isEvening ? '06:00 PM' : '08:00 AM');
 
     let progress = (isVisited || isMissed) ? 1.0 : 0.0;
-    if (isCurrent && idx < displayStops.length - 1 && busPosition?.lat && busPosition?.lon) {
+    if (isCurrent && idx < displayStops.length - 1 && animatedBus) {
       const nextStop = displayStops[idx + 1];
       const dTotal = haversineDistKm(Number(stop.lat), Number(stop.lon), Number(nextStop.lat), Number(nextStop.lon));
-      const dRemaining = haversineDistKm(Number(busPosition.lat), Number(busPosition.lon), Number(nextStop.lat), Number(nextStop.lon));
+      const dRemaining = haversineDistKm(animatedBus[1], animatedBus[0], Number(nextStop.lat), Number(nextStop.lon));
       if (dTotal > 0.05) progress = Math.max(0.0, Math.min(1.0, 1.0 - (dRemaining / dTotal)));
     }
 
@@ -457,12 +538,33 @@ export default function RouteViewScreen({ route, navigation }: any) {
     } else if (isMissed) {
       statusSubtext = 'Missed';
     } else if (isOnline) {
-      liveTime = computeEstimatedTime(scheduledDaily, globalDelay);
-      delayType = globalDelay > 1 ? 'late' : globalDelay < -1 ? 'ahead' : 'ontime';
-      if (isCurrent) statusSubtext = eta.eta_minutes != null ? `Approaching • ${Math.round(eta.eta_minutes)}m` : 'Next Stop';
-      else if (delayType === 'late') statusSubtext = `+${globalDelay}m delay`;
-      else if (delayType === 'ahead') statusSubtext = `${Math.abs(globalDelay)}m ahead`;
-      else statusSubtext = 'On time';
+      let usedMl = false;
+      if (!isVisited && !isMissed && mlEtas && mlEtas[stop.id] !== undefined) {
+        const now = new Date();
+        const currentMins = now.getHours() * 60 + now.getMinutes();
+        const scheduledMins = parseTimeToMinutes(scheduledDaily);
+        if (scheduledMins) {
+          const mlPredictedDelay = Math.round(currentMins + mlEtas[stop.id] - scheduledMins);
+          liveTime = computeEstimatedTime(scheduledDaily, mlPredictedDelay) || scheduledDaily;
+          if (mlPredictedDelay > 1) { delayType = 'late'; statusSubtext = `Delayed by ${mlPredictedDelay}m`; }
+          else if (mlPredictedDelay < -1) { delayType = 'ahead'; statusSubtext = `${Math.abs(mlPredictedDelay)}m ahead`; }
+          else { delayType = 'ontime'; statusSubtext = `On time`; }
+          usedMl = true;
+          
+          if (isCurrent && eta?.eta_minutes != null) {
+            statusSubtext = `Approaching • ${Math.round(eta.eta_minutes)}m`;
+          }
+        }
+      }
+
+      if (!usedMl) {
+        liveTime = computeEstimatedTime(scheduledDaily, globalDelay);
+        delayType = globalDelay > 1 ? 'late' : globalDelay < -1 ? 'ahead' : 'ontime';
+        if (isCurrent) statusSubtext = eta?.eta_minutes != null ? `Approaching • ${Math.round(eta.eta_minutes)}m` : 'Next Stop';
+        else if (delayType === 'late') statusSubtext = `+${globalDelay}m delay`;
+        else if (delayType === 'ahead') statusSubtext = `${Math.abs(globalDelay)}m ahead`;
+        else statusSubtext = 'On time';
+      }
     } else {
       statusSubtext = 'Scheduled';
     }
@@ -478,6 +580,8 @@ export default function RouteViewScreen({ route, navigation }: any) {
       isCurrent,
       isMissed,
       progress,
+      lat: stop.lat,
+      lon: stop.lon,
     };
   });
 
@@ -498,23 +602,26 @@ export default function RouteViewScreen({ route, navigation }: any) {
       <StatusBar barStyle="dark-content" backgroundColor={Colors.bgGray} />
       <TopBar />
 
-      <ScrollView
-        contentContainerStyle={S.scrollContent}
-        showsVerticalScrollIndicator={false}
-        refreshControl={
-          <RefreshControl
-            refreshing={refreshing}
-            onRefresh={() => fetchData(true)}
-            tintColor={Colors.mint}
-          />
-        }
-      >
-        {/* ── Header ───────────────────────────────────────────────────── */}
+      {/* ── Fixed Header Area (always visible above toggle) ──────────────── */}
+      <View style={S.headerArea}>
+        {/* Header Row */}
         <View style={S.headerRow}>
-          <Text style={S.screenTitle}>Route View</Text>
+          <View style={{ flex: 1 }}>
+            <Text style={S.screenTitle} numberOfLines={1}>
+              {displayLocationName || busPosition?.location_name || 'Fetching location...'}
+            </Text>
+            <Text style={[S.statLabel, { marginTop: 2, textAlign: 'left' }]}>
+              CURRENT LOCATION
+            </Text>
+          </View>
+          {busPosition?.server_time && (
+            <Text style={[S.lastUpdatedText, { alignSelf: 'flex-start', marginTop: 4 }]}>
+              Last updated: {formatLastUpdated(busPosition.server_time)}
+            </Text>
+          )}
         </View>
 
-        {/* ── Status subtext (dynamic, mirrors PWA) ─────────────────────── */}
+        {/* Status subtext */}
         <Text style={[
           S.tripSubtext,
           status === 'connecting' && { color: '#d97706' },
@@ -524,7 +631,7 @@ export default function RouteViewScreen({ route, navigation }: any) {
           {getSubtextStatus()}
         </Text>
 
-        {/* ── Error banner ─────────────────────────────────────────────── */}
+        {/* Error banner */}
         {error ? (
           <View style={S.errorBanner}>
             <Ionicons name="alert-circle-outline" size={16} color={Colors.danger} />
@@ -532,18 +639,7 @@ export default function RouteViewScreen({ route, navigation }: any) {
           </View>
         ) : null}
 
-        {/* ── Trip pill row (only when not idle) ───────────────────────── */}
-        {!isIdleMode && isOnline && (
-          <View style={S.tripRow}>
-            <View style={S.tripPill}>
-              <Text style={S.tripPillText}>{tripName || 'Active'}</Text>
-            </View>
-            <Ionicons name="arrow-forward" size={18} color={Colors.darkGray} style={S.tripArrow} />
-            <Text style={S.tripDest} numberOfLines={1}>{destination.toUpperCase()}</Text>
-          </View>
-        )}
-
-        {/* ── Stats card — hidden in idle mode ─────────────────────────── */}
+        {/* Stats card — hidden in idle mode */}
         {!isIdleMode && (
           <View style={S.statsCard}>
             <View style={S.statItem}>
@@ -557,169 +653,263 @@ export default function RouteViewScreen({ route, navigation }: any) {
               </Text>
               <Text style={S.statLabel}>SPEED</Text>
             </View>
-            <View style={S.statDivider} />
-            <View style={S.statItem}>
-              <Text style={S.statValue}>{`${doneCount}/${totalCount}`}</Text>
-              <Text style={S.statLabel}>STOPS</Text>
+          </View>
+        )}
+      </View>
+
+      {/* ── Toggle Bar (Route View / Map View) ───────────────────────────── */}
+      <View style={S.toggleBar}>
+        <View style={S.toggleTrack}>
+          <TouchableOpacity
+            style={[S.toggleTab, viewMode === 'route' && S.toggleTabActive]}
+            onPress={() => setViewMode('route')}
+            activeOpacity={0.7}
+          >
+            <Ionicons
+              name="list-outline"
+              size={16}
+              color={viewMode === 'route' ? '#1c1c1e' : '#6b7280'}
+            />
+            <Text style={[S.toggleTabText, viewMode === 'route' && S.toggleTabTextActive]}>
+              Route View
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[S.toggleTab, viewMode === 'map' && S.toggleTabActive]}
+            onPress={() => { setViewMode('map'); recenter(); }}
+            activeOpacity={0.7}
+          >
+            <Ionicons
+              name="map-outline"
+              size={16}
+              color={viewMode === 'map' ? '#1c1c1e' : '#6b7280'}
+            />
+            <Text style={[S.toggleTabText, viewMode === 'map' && S.toggleTabTextActive]}>
+              Map View
+            </Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      {/* ── Dynamic Content Area ─────────────────────────────────────────── */}
+      <View style={S.contentArea}>
+
+        {/* ── Route View Panel ───────────────────────────────────────────── */}
+        {viewMode === 'route' && (
+          <View style={S.routePanel}>
+            {/* Stop timeline card / Idle animation */}
+            <View style={[S.cardFull, isIdleMode && S.cardIdle]}>
+              {isIdleMode ? (
+                <BusIdleAnimation
+                  nextTripTime={nextTripTime}
+                  isUnscheduled={isUnscheduled}
+                />
+              ) : timeline.length === 0 ? (
+                <View style={S.emptyState}>
+                  <Ionicons name="bus-outline" size={28} color={Colors.lightGray} />
+                  <Text style={S.emptyStateText}>
+                    {status === 'connecting' ? 'Connecting to Bus GPS…' : 'No stop arrivals recorded yet.'}
+                  </Text>
+                </View>
+              ) : (
+                <ScrollView
+                  ref={scrollViewRef}
+                  style={S.timelineScroll}
+                  showsVerticalScrollIndicator={true}
+                  nestedScrollEnabled={true}
+                  indicatorStyle="black"
+                  refreshControl={
+                    <RefreshControl
+                      refreshing={refreshing}
+                      onRefresh={() => fetchData(true)}
+                      tintColor={Colors.mint}
+                    />
+                  }
+                >
+                  {timeline.map((item, idx) => {
+                    const isLast = idx === timeline.length - 1;
+                    return (
+                      <View key={`${item.id}-${idx}`} style={S.timelineRow}>
+                        {/* Left: Scheduled Time (Top) & Live/ETA Time (Bottom in Red/Green) */}
+                        <View style={S.timeLeftCol}>
+                          <Text style={S.schedTimeText}>{item.scheduledTime}</Text>
+                          {item.liveTime ? (
+                            <Text style={[
+                              S.liveTimeText,
+                              item.delayType === 'late' && S.timeTextLate,
+                              (item.delayType === 'ahead' || item.delayType === 'ontime') && S.timeTextAhead,
+                            ]}>
+                              {item.liveTime}
+                            </Text>
+                          ) : (
+                            <Text style={S.liveTimeTextMuted}>—</Text>
+                          )}
+                        </View>
+
+                        {/* Center: Track line & Dot / Bus Badge */}
+                        <View style={S.timelineTrackCol}>
+                          <View style={[
+                            S.trackDot,
+                            (item.isVisited || item.isCurrent) && S.trackDotVisited,
+                            item.isMissed && S.trackDotMissed,
+                          ]} />
+                          {!isLast && (
+                            <View style={S.trackLine}>
+                              {item.progress > 0 && (
+                                <View style={[
+                                  S.trackLineActiveOverlay,
+                                  { height: `${item.progress * 100}%` }
+                                ]} />
+                              )}
+                            </View>
+                          )}
+                          {item.isCurrent && (
+                            <Animated.View style={[
+                              S.busBadgeWrapper,
+                              { 
+                                position: 'absolute',
+                                top: '50%',
+                                marginTop: -14 + (item.progress * 56),
+                                transform: [{ scale: pulseAnim }] 
+                              }
+                            ]}>
+                              <View style={S.busBadgeCircle}>
+                                <Ionicons name="bus" size={13} color="#ffffff" />
+                              </View>
+                            </Animated.View>
+                          )}
+                        </View>
+
+                        {/* Right: Stop Name & Subtext */}
+                        <View style={S.stopInfoCol}>
+                          <Text style={[
+                            S.stopName,
+                            item.isCurrent && S.stopNameCurrent,
+                            item.isVisited && S.stopNameVisited,
+                            item.isMissed && S.stopNameMissed,
+                          ]} numberOfLines={1}>
+                            {item.name}
+                          </Text>
+                          {item.statusSubtext ? (
+                            <Text style={[
+                              S.stopSubtext,
+                              item.isCurrent && S.stopSubtextCurrent,
+                              item.isMissed && S.stopSubtextMissed,
+                              item.delayType === 'late' && !item.isVisited && !item.isMissed && S.stopSubtextLate,
+                              (item.delayType === 'ahead' || item.delayType === 'ontime') && !item.isVisited && !item.isMissed && S.stopSubtextAhead,
+                            ]}>
+                              {item.statusSubtext}
+                            </Text>
+                          ) : null}
+                        </View>
+                      </View>
+                    );
+                  })}
+                </ScrollView>
+              )}
             </View>
           </View>
         )}
 
-
-        {/* ── Stop timeline card / Idle animation ──────────────────────── */}
-        <View style={[S.card, isIdleMode && S.cardIdle]}>
-          {isIdleMode ? (
-            <BusIdleAnimation
-              nextTripTime={nextTripTime}
-              isUnscheduled={isUnscheduled}
-            />
-          ) : timeline.length === 0 ? (
-            <View style={S.emptyState}>
-              <Ionicons name="bus-outline" size={28} color={Colors.lightGray} />
-              <Text style={S.emptyStateText}>
-                {status === 'connecting' ? 'Connecting to Bus GPS…' : 'No stop arrivals recorded yet.'}
-              </Text>
-            </View>
-          ) : (
-            <ScrollView
-              ref={scrollViewRef}
-              style={{ maxHeight: TIMELINE_VISIBLE_HEIGHT }}
-              showsVerticalScrollIndicator={true}
-              nestedScrollEnabled={true}
-              indicatorStyle="black"
+        {/* ── Map View Panel ─────────────────────────────────────────────── */}
+        {viewMode === 'map' && (
+          <View style={S.mapPanel}>
+            <Map
+              style={S.fullMap}
+              mapStyle={MAP_STYLE}
+              onTouchStart={() => setAutoCenter(false)}
             >
-              {timeline.map((item, idx) => {
-                const isLast = idx === timeline.length - 1;
-                return (
-                  <View key={`${item.id}-${idx}`} style={S.timelineRow}>
-                    {/* Left: Scheduled Time (Top) & Live/ETA Time (Bottom in Red/Green) */}
-                    <View style={S.timeLeftCol}>
-                      <Text style={S.schedTimeText}>{item.scheduledTime}</Text>
-                      {item.liveTime ? (
-                        <Text style={[
-                          S.liveTimeText,
-                          item.delayType === 'late' && S.timeTextLate,
-                          (item.delayType === 'ahead' || item.delayType === 'ontime') && S.timeTextAhead,
-                        ]}>
-                          {item.liveTime}
-                        </Text>
-                      ) : (
-                        <Text style={S.liveTimeTextMuted}>—</Text>
-                      )}
-                    </View>
+              <Camera
+                ref={cameraRef}
+                center={mapVp.center}
+                zoom={zoomLevel}
+                duration={500}
+              />
 
-                    {/* Center: Track line & Dot / Bus Badge */}
-                    <View style={S.timelineTrackCol}>
-                      {item.isCurrent ? (
-                        <Animated.View style={[S.busBadgeWrapper, { transform: [{ scale: pulseAnim }] }]}>
-                          <View style={S.busBadgeCircle}>
-                            <Ionicons name="bus" size={13} color="#ffffff" />
-                          </View>
-                        </Animated.View>
-                      ) : (
-                        <View style={[
-                          S.trackDot,
-                          item.isVisited && S.trackDotVisited,
-                          item.isMissed && S.trackDotMissed,
-                        ]} />
-                      )}
-                      {!isLast && (
-                        <View style={S.trackLine}>
-                          {item.progress > 0 && (
-                            <View style={[
-                              S.trackLineActiveOverlay,
-                              { height: `${item.progress * 100}%` }
-                            ]} />
-                          )}
-                        </View>
-                      )}
-                    </View>
+              {plannedCoords.length > 1 && (
+                <GeoJSONSource id="planned" data={plannedGeoJSON}>
+                  <Layer
+                    id="planned-line"
+                    type="line"
+                    paint={{ 'line-color': '#94a3b8', 'line-width': 2.5, 'line-opacity': 0.5 }}
+                    layout={{ 'line-cap': 'round', 'line-join': 'round' }}
+                  />
+                </GeoJSONSource>
+              )}
 
-                    {/* Right: Stop Name & Subtext */}
-                    <View style={S.stopInfoCol}>
-                      <Text style={[
-                        S.stopName,
-                        item.isCurrent && S.stopNameCurrent,
-                        item.isVisited && S.stopNameVisited,
-                        item.isMissed && S.stopNameMissed,
-                      ]} numberOfLines={1}>
-                        {item.name}
-                      </Text>
-                      {item.statusSubtext ? (
-                        <Text style={[
-                          S.stopSubtext,
-                          item.isCurrent && S.stopSubtextCurrent,
-                          item.isMissed && S.stopSubtextMissed,
-                          item.delayType === 'late' && !item.isVisited && !item.isMissed && S.stopSubtextLate,
-                          (item.delayType === 'ahead' || item.delayType === 'ontime') && !item.isVisited && !item.isMissed && S.stopSubtextAhead,
-                        ]}>
-                          {item.statusSubtext}
-                        </Text>
-                      ) : null}
+              {trailCoords.length > 1 && (
+                <GeoJSONSource id="trail" data={trailGeoJSON}>
+                  <Layer
+                    id="trail-line"
+                    type="line"
+                    paint={{ 'line-color': '#2563eb', 'line-width': 4 }}
+                    layout={{ 'line-cap': 'round', 'line-join': 'round' }}
+                  />
+                </GeoJSONSource>
+              )}
+
+              {!isIdleMode && stops.map((stop: any) => (
+                <Marker key={`s-${stop.id}`} id={`s-${stop.id}`} lngLat={[stop.lon, stop.lat]}>
+                  <View style={S.stopDot} />
+                </Marker>
+              ))}
+
+              {animatedBus && (
+                <Marker id="bus" lngLat={animatedBus}>
+                  <View style={S.busMarkerContainer}>
+                    <View style={[S.busMarkerPin, { 
+                      backgroundColor: isLive ? '#16a34a' : '#6b7280', 
+                      borderColor: '#ffffff'
+                    }]}>
+                      <View style={S.busMarkerIconWrapper}>
+                        <Ionicons name="bus" size={17} color="#fff" />
+                      </View>
                     </View>
                   </View>
-                );
-              })}
-            </ScrollView>
-          )}
-        </View>
+                </Marker>
+              )}
+            </Map>
 
-        {/* ── Live Map thumbnail ───────────────────────────────────────── */}
-        <View style={S.sectionHeaderRow}>
-          <Text style={S.sectionTitle}>Live Map</Text>
-          {busPosition?.server_time && (
-            <Text style={S.lastUpdatedText}>
-              Last updated: {formatLastUpdated(busPosition.server_time)}
-            </Text>
-          )}
-        </View>
-        <TouchableOpacity
-          style={S.mapCard}
-          activeOpacity={0.92}
-          onPress={() => navigation.navigate('MapFull')}
-        >
-          <Map
-            style={S.miniMap}
-            mapStyle={MAP_STYLE}
-            scrollEnabled={false}
-            zoomEnabled={false}
-            pitchEnabled={false}
-            rotateEnabled={false}
-          >
-            <Camera ref={cameraRef} center={mapVp.center} zoom={mapVp.zoom} pitch={50} />
-
-            {plannedCoords.length > 1 && (
-              <GeoJSONSource id="mini-planned" data={plannedGeoJSON}>
-                <Layer id="mini-planned-line" type="line" paint={{ 'line-color': '#94a3b8', 'line-width': 2.5, 'line-opacity': 0.5 }} layout={{ 'line-cap': 'round', 'line-join': 'round' }} />
-              </GeoJSONSource>
-            )}
-
-            {trailCoords.length > 1 && (
-              <GeoJSONSource id="mini-trail" data={trailGeoJSON}>
-                <Layer id="mini-trail-line" type="line" paint={{ "line-color": "#2563eb", "line-width": 3 }} layout={{ "line-cap": "round", "line-join": "round" }} />
-              </GeoJSONSource>
-            )}
-
-            {animatedBus && (
-              <Marker id="mini-bus" lngLat={animatedBus}>
-                <View style={S.adminMarkerContainer}>
-                  <Ionicons name="location" size={42} color={isLive ? '#16a34a' : '#6b7280'} style={S.adminMarkerPin} />
-                  <Ionicons name="bus" size={14} color="#ffffff" style={S.adminMarkerBus} />
-                </View>
-              </Marker>
-            )}
-          </Map>
-
-          {/* Tap overlay */}
-          <View style={S.mapOverlay}>
-            <View style={S.tapPill}>
-              <Text style={S.tapPillText}>Tap to view full map</Text>
+            {/* Map Controls */}
+            <View style={S.mapControls}>
+              <TouchableOpacity
+                style={[S.mapCtrlBtn, autoCenter && S.mapCtrlBtnActive]}
+                onPress={recenter}
+                activeOpacity={0.7}
+              >
+                <Ionicons name="locate-outline" size={22} color={autoCenter ? '#007AFF' : '#6b7280'} />
+              </TouchableOpacity>
+              <View style={S.mapCtrlDivider} />
+              <TouchableOpacity
+                style={S.mapCtrlBtn}
+                onPress={handleZoomIn}
+                activeOpacity={0.7}
+              >
+                <Ionicons name="add" size={22} color="#1f2937" />
+              </TouchableOpacity>
+              <View style={S.mapCtrlDivider} />
+              <TouchableOpacity
+                style={S.mapCtrlBtn}
+                onPress={handleZoomOut}
+                activeOpacity={0.7}
+              >
+                <Ionicons name="remove" size={22} color="#1f2937" />
+              </TouchableOpacity>
             </View>
-          </View>
-        </TouchableOpacity>
 
-        <View style={{ height: 40 }} />
-      </ScrollView>
+            {/* Status pill */}
+            {animatedBus && (
+              <View style={S.statusPill}>
+                <View style={[S.statusDot, { backgroundColor: isLive ? '#16a34a' : '#9ca3af' }]} />
+                <Text style={S.statusText}>
+                  {isLive ? 'Bus Live' : 'Last Known'}
+                  {(displayLocationName || busPosition?.location_name) ? ` • ${displayLocationName || busPosition.location_name}` : ''}
+                </Text>
+              </View>
+            )}
+          </View>
+        )}
+      </View>
     </SafeAreaView>
   );
 }
@@ -727,54 +917,93 @@ export default function RouteViewScreen({ route, navigation }: any) {
 const S = StyleSheet.create({
   safe:          { flex: 1, backgroundColor: Colors.bgGray },
   centeredFill:  { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 12 },
-  loadingText:   { fontSize: 14, color: Colors.medGray },
-  scrollContent: { paddingHorizontal: 20, paddingTop: 20, paddingBottom: 10 },
+  loadingText:   { fontSize: 17, color: Colors.medGray },
 
-  // Header — PWA: .ios-header-row + .ios-screen-title
-  headerRow:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 },
-  screenTitle:   { fontSize: 24, fontWeight: '800', color: Colors.black, letterSpacing: -0.5 },
-  tripSubtext:   { fontSize: 14, fontWeight: '600', color: Colors.medGray, marginBottom: 12, lineHeight: 18 },
-  liveBadge:     { flexDirection: 'row', alignItems: 'center', backgroundColor: '#dcfce7', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20, gap: 6 },
-  offlineBadge:  { backgroundColor: '#fee2e2' },
-  liveDot:       { width: 8, height: 8, borderRadius: 4, backgroundColor: '#15803d' },
-  offlineDot:    { backgroundColor: Colors.danger },
-  liveText:      { fontSize: 12, fontWeight: '700', color: '#15803d' },
-  offlineText:   { color: Colors.danger },
+  // ── Fixed Header Area ──────────────────────────────────────────────────
+  headerArea:    { paddingHorizontal: 20, paddingTop: 16, backgroundColor: Colors.white },
+  headerRow:     { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 },
+  screenTitle:   { fontSize: 28, fontWeight: '800', color: Colors.black, letterSpacing: -0.5 },
+  lastUpdatedText: { fontSize: 15, color: Colors.medGray, fontWeight: '600' },
+  tripSubtext:   { fontSize: 17, fontWeight: '600', color: Colors.medGray, marginBottom: 10, lineHeight: 24 },
 
   // Error
   errorBanner:     { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#fff5f5', borderRadius: 12, padding: 12, marginBottom: 14, borderWidth: 1, borderColor: '#fecaca' },
-  errorBannerText: { fontSize: 13, color: Colors.danger, flex: 1 },
-
-  // Trip row
-  tripRow:         { flexDirection: 'row', alignItems: 'center', marginBottom: 12, gap: 6 },
-  tripPill:        { backgroundColor: Colors.mintLighter, paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20 },
-  tripPillOffline: { backgroundColor: '#f3f4f6' },
-  tripPillText:    { fontSize: 14, fontWeight: '800', color: Colors.mintText },
-  tripPillTextOff: { color: Colors.medGray },
-  tripArrow:       { marginHorizontal: 2 },
-  tripDest:        { fontSize: 14, fontWeight: '700', color: Colors.darkGray, flex: 1 },
+  errorBannerText: { fontSize: 14, color: Colors.danger, flex: 1 },
 
   // Stats card — PWA: .ios-stats-card
-  statsCard:       { backgroundColor: Colors.white, borderRadius: 16, flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', paddingVertical: 18, paddingHorizontal: 16, marginBottom: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.05, shadowRadius: 12, elevation: 3 },
+  statsCard:       { backgroundColor: Colors.white, borderRadius: 16, flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', paddingVertical: 14, paddingHorizontal: 16, marginBottom: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.05, shadowRadius: 12, elevation: 3, borderWidth: 1, borderColor: 'rgba(0,0,0,0.04)' },
   statItem:        { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 4 },
-  statValue:       { fontSize: 20, fontWeight: '800', color: Colors.black },
-  statLabel:       { fontSize: 12, fontWeight: '700', color: Colors.lightGray, letterSpacing: 0.5, textAlign: 'center' },
+  statValue:       { fontSize: 24, fontWeight: '800', color: Colors.black },
+  statLabel:       { fontSize: 14, fontWeight: '700', color: Colors.lightGray, letterSpacing: 0.5, textAlign: 'center' },
   statDivider:     { width: 1, height: 32, backgroundColor: Colors.separator, marginTop: 4 },
 
-  // Timeline card — PWA: .ios-timeline-card
-  card:            { backgroundColor: Colors.white, borderRadius: 20, paddingVertical: 18, marginBottom: 20, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.05, shadowRadius: 16, elevation: 3 },
-  cardIdle:        { paddingBottom: 8, overflow: 'hidden', shadowOpacity: 0, elevation: 0, backgroundColor: 'transparent' },
+  // ── Toggle Bar ─────────────────────────────────────────────────────────
+  toggleBar: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    backgroundColor: Colors.white,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(0,0,0,0.06)',
+  },
+  toggleTrack: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#f2f4f7',
+    borderRadius: 14,
+    padding: 3,
+    gap: 3,
+  },
+  toggleTab: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 11,
+    backgroundColor: 'transparent',
+  },
+  toggleTabActive: {
+    backgroundColor: Colors.white,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.10,
+    shadowRadius: 6,
+    elevation: 4,
+  },
+  toggleTabText: {
+    fontSize: 17,
+    fontWeight: '600',
+    color: '#6b7280',
+    letterSpacing: -0.2,
+  },
+  toggleTabTextActive: {
+    color: '#1c1c1e',
+    fontWeight: '700',
+  },
+
+  // ── Content Area ───────────────────────────────────────────────────────
+  contentArea: { flex: 1 },
+
+  // Route panel — fills remaining screen height
+  routePanel: { flex: 1, paddingHorizontal: 16, paddingTop: 8 },
+
+  // Timeline card — fills the route panel
+  cardFull:        { flex: 1, backgroundColor: Colors.white, borderRadius: 20, paddingVertical: 10, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.05, shadowRadius: 16, elevation: 3, overflow: 'hidden' },
+  cardIdle:        { paddingBottom: 48, shadowOpacity: 0, elevation: 0, backgroundColor: 'transparent', justifyContent: 'center' },
+  timelineScroll:  { flex: 1 },
   emptyState:      { alignItems: 'center', paddingVertical: 24 },
-  emptyStateText:  { fontSize: 16, color: Colors.medGray, textAlign: 'center', marginTop: 12 },
+  emptyStateText:  { fontSize: 17, color: Colors.medGray, textAlign: 'center', marginTop: 12 },
 
   // Timeline rows — PWA: .ios-timeline-row (height: 54px)
-  timelineRow:        { flexDirection: 'row', height: 54, alignItems: 'stretch', paddingHorizontal: 20 },
-  timeLeftCol:        { width: 62, alignItems: 'flex-start', justifyContent: 'center' },
-  schedTimeText:      { fontSize: 12, fontWeight: '700', color: '#4b5563', marginBottom: 2 },
-  liveTimeText:       { fontSize: 12, fontWeight: '800', color: '#16a34a' },
+  timelineRow:        { flexDirection: 'row', height: 58, alignItems: 'stretch', paddingHorizontal: 20 },
+  timeLeftCol:        { width: 70, alignItems: 'flex-start', justifyContent: 'center' },
+  schedTimeText:      { fontSize: 15, fontWeight: '700', color: '#4b5563', marginBottom: 2 },
+  liveTimeText:       { fontSize: 15, fontWeight: '800', color: '#16a34a' },
   timeTextLate:       { color: '#dc2626' },
   timeTextAhead:      { color: '#16a34a' },
-  liveTimeTextMuted:  { fontSize: 12, fontWeight: '600', color: '#d1d5db' },
+  liveTimeTextMuted:  { fontSize: 15, fontWeight: '600', color: '#d1d5db' },
 
   timelineTrackCol:   { width: 32, alignItems: 'center', justifyContent: 'center', position: 'relative', alignSelf: 'stretch' },
   trackDot:           { width: 10, height: 10, borderRadius: 5, backgroundColor: '#9ca3af', zIndex: 2 },
@@ -787,32 +1016,97 @@ const S = StyleSheet.create({
   busBadgeCircle:     { width: 22, height: 22, borderRadius: 11, backgroundColor: '#16a34a', alignItems: 'center', justifyContent: 'center', shadowColor: '#16a34a', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.35, shadowRadius: 4, elevation: 4 },
 
   stopInfoCol:        { flex: 1, paddingLeft: 12, justifyContent: 'center' },
-  stopName:           { fontSize: 14, fontWeight: '700', color: '#1f2937', marginBottom: 2 },
+  stopName:           { fontSize: 17, fontWeight: '700', color: '#1f2937', marginBottom: 2 },
   stopNameCurrent:    { color: '#16a34a', fontWeight: '800' },
   stopNameVisited:    { color: '#4b5563' },
   stopNameMissed:     { color: '#dc2626', textDecorationLine: 'line-through' },
-  stopSubtext:        { fontSize: 11, fontWeight: '600', color: '#9ca3af' },
+  stopSubtext:        { fontSize: 14, fontWeight: '600', color: '#9ca3af' },
   stopSubtextCurrent: { color: '#16a34a', fontWeight: '700' },
   stopSubtextMissed:  { color: '#dc2626', fontWeight: '700' },
   stopSubtextLate:    { color: '#dc2626', fontWeight: '700' },
   stopSubtextAhead:   { color: '#16a34a', fontWeight: '700' },
 
-  // Section title
-  sectionHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, paddingHorizontal: 4 },
-  sectionTitle:    { fontSize: 22, fontWeight: '800', color: Colors.black },
-  lastUpdatedText: { fontSize: 12, color: Colors.medGray, fontWeight: '600' },
+  // ── Map View ───────────────────────────────────────────────────────────
+  mapPanel:    { flex: 1, position: 'relative' },
+  fullMap:     { flex: 1 },
+  stopDot:     { width: 10, height: 10, borderRadius: 5, backgroundColor: '#2563eb', borderWidth: 2, borderColor: '#fff' },
+  busMarkerContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingBottom: 16, // offset to place the pin tip exactly at the coordinates
+  },
+  busMarkerPin: {
+    width: 32,
+    height: 32,
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    borderBottomLeftRadius: 16,
+    borderBottomRightRadius: 2,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 2.5,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 5,
+    transform: [{ rotate: '45deg' }],
+  },
+  busMarkerIconWrapper: {
+    transform: [{ rotate: '-45deg' }],
+  },
 
-  // Map card
-  mapCard:         { height: 280, marginBottom: 20, borderRadius: 20, overflow: 'hidden', backgroundColor: Colors.bgGray, position: 'relative', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 16, elevation: 6 },
-  miniMap:         { flex: 1 },
-  miniStopDot:     { width: 8, height: 8, borderRadius: 4, backgroundColor: '#2563eb', borderWidth: 1.5, borderColor: Colors.white },
-  
-  // Admin Marker Style
-  adminMarkerContainer: { width: 42, height: 42, alignItems: 'center', justifyContent: 'center', shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.4, shadowRadius: 5, elevation: 6 },
-  adminMarkerPin: { position: 'absolute', top: 0 },
-  adminMarkerBus: { position: 'absolute', top: 7 }, 
+  // Map Controls
+  mapControls: {
+    position: 'absolute',
+    bottom: 24,
+    right: 16,
+    backgroundColor: 'rgba(255,255,255,0.92)',
+    borderRadius: 14,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 10,
+    elevation: 8,
+    overflow: 'hidden',
+  },
+  mapCtrlBtn: {
+    width: 44,
+    height: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  mapCtrlBtnActive: {
+    backgroundColor: 'rgba(0, 122, 255, 0.08)',
+  },
+  mapCtrlDivider: {
+    height: 1,
+    backgroundColor: 'rgba(0,0,0,0.08)',
+    marginHorizontal: 8,
+  },
 
-  mapOverlay:      { ...StyleSheet.absoluteFill, justifyContent: 'flex-end', alignItems: 'center', paddingBottom: 16 },
-  tapPill:         { backgroundColor: 'rgba(255,255,255,0.94)', paddingHorizontal: 22, paddingVertical: 10, borderRadius: 24, shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.12, shadowRadius: 8, elevation: 4 },
-  tapPillText:     { fontSize: 14, fontWeight: '700', color: Colors.black },
+  // Status pill
+  statusPill: {
+    position: 'absolute',
+    top: 16,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(255,255,255,0.95)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderRadius: 24,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.12,
+    shadowRadius: 8,
+    elevation: 6,
+  },
+  statusDot: { width: 8, height: 8, borderRadius: 4 },
+  statusText: { fontSize: 17, fontWeight: '700', color: Colors.black },
 });
+
+
+
+

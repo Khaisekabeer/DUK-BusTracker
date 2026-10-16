@@ -21,6 +21,7 @@ import Ionicons from '@react-native-vector-icons/ionicons';
 import Colors from '../theme/colors';
 import { authApi } from '../services/api';
 import { saveToken, saveUser } from '../services/storage';
+import { registerForPushNotificationsAsync } from '../services/firebaseService';
 
 const CODE_LENGTH = 6;
 
@@ -110,6 +111,9 @@ export default function OtpModal({
 
       await saveToken(access_token);
       await saveUser(user);
+
+      // Register device for push notifications
+      registerForPushNotificationsAsync().catch(() => {});
 
       setOtpVerified(true);
       Animated.spring(successScale, {

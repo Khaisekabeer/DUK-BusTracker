@@ -22,7 +22,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import Colors from '../theme/colors';
 import TopBar from '../components/TopBar';
 import { authApi } from '../services/api';
-import { saveToken, saveUser } from '../services/storage';
+import { saveToken, saveUser, saveRefreshToken } from '../services/storage';
 import { registerForPushNotificationsAsync } from '../services/firebaseService';
 
 const CODE_LENGTH = 6;
@@ -99,10 +99,13 @@ export default function OtpVerifyScreen({ navigation, route }: any) {
     setError('');
     try {
       const res = await authApi.verify(email, enteredCode);
-      const { access_token, user } = res.data;
+      const { access_token, refresh_token, user } = res.data;
 
       // Persist token and user info locally
       await saveToken(access_token);
+      if (refresh_token) {
+        await saveRefreshToken(refresh_token);
+      }
       await saveUser({
         id:              user.id,
         name:            user.name,

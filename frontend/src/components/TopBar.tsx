@@ -6,7 +6,7 @@
  *   Right  → notification bell (44×44) → bottom-sheet popup
  */
 import React, { useState } from 'react';
-import { View, TouchableOpacity, Image, StyleSheet } from 'react-native';
+import { View, Text, TouchableOpacity, Image, StyleSheet } from 'react-native';
 import Ionicons from '@react-native-vector-icons/ionicons';
 import Colors from '../theme/colors';
 import { useDrawer } from './DrawerMenu';
@@ -15,11 +15,16 @@ import NotificationPopup from './NotificationPopup';
 type TopBarProps = {
   showBack?: boolean;
   onBack?: () => void;
+  title?: string | null;
+  showNotification?: boolean;
 };
 
-export default function TopBar({ showBack, onBack }: TopBarProps) {
+export default function TopBar({ showBack, onBack, title, showNotification }: TopBarProps) {
   const { openDrawer } = useDrawer();
   const [notifOpen, setNotifOpen] = useState(false);
+
+  // If title is passed, default showNotification to false unless explicitly true
+  const displayBell = typeof showNotification === 'boolean' ? showNotification : !title;
 
   return (
     <View style={S.topBar}>
@@ -36,17 +41,27 @@ export default function TopBar({ showBack, onBack }: TopBarProps) {
         )}
       </View>
 
-      {/* Center — absolutely positioned logos */}
-      <View style={S.center} pointerEvents="none">
-        <Image source={require('../../duklogo.png')} style={S.logoDuk} resizeMode="contain" />
-        <Image source={require('../../canlab.png')}  style={S.logoCanlab} resizeMode="contain" />
-      </View>
+      {/* Center — title if supplied, otherwise logos */}
+      {title ? (
+        <View style={S.centerTitleContainer} pointerEvents="none">
+          <Text style={S.centerTitleText}>{title}</Text>
+        </View>
+      ) : (
+        <View style={S.center} pointerEvents="none">
+          <Image source={require('../../duklogo.png')} style={S.logoDuk} resizeMode="contain" />
+          <Image source={require('../../canlab.png')}  style={S.logoCanlab} resizeMode="contain" />
+        </View>
+      )}
 
-      {/* Right — notification bell */}
+      {/* Right — notification bell or spacer */}
       <View style={S.side}>
-        <TouchableOpacity style={S.iconBtn} onPress={() => setNotifOpen(true)} activeOpacity={0.7}>
-          <Ionicons name="notifications-outline" size={22} color={Colors.gold} />
-        </TouchableOpacity>
+        {displayBell ? (
+          <TouchableOpacity style={S.iconBtn} onPress={() => setNotifOpen(true)} activeOpacity={0.7}>
+            <Ionicons name="notifications-outline" size={22} color={Colors.gold} />
+          </TouchableOpacity>
+        ) : (
+          <View style={S.iconBtn} />
+        )}
       </View>
 
       <NotificationPopup visible={notifOpen} onClose={() => setNotifOpen(false)} />
@@ -83,6 +98,19 @@ const S = StyleSheet.create({
     justifyContent: 'center',
     gap: 80,
     zIndex: -1,
+  },
+  centerTitleContainer: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: -1,
+  },
+  centerTitleText: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: Colors.black,
   },
   /* PWA: .topbar__icon-btn — 44×44, border-radius 16 */
   iconBtn: {
