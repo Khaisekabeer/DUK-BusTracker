@@ -1,0 +1,85 @@
+<USER_REQUEST>
+DUK Bus Tracker — Backend Authentication & Authorization Report
+Audience: Frontend / Android developer agent
+Generated from: Full source-code analysis of /opt/duk_micro
+Date: 2026-10-16
+
+Table of Contents
+Architecture Overview
+Authentication Flow (OTP + JWT)
+JWT Token Specification
+Token Lifecycle — Create, Use, Refresh, Revoke
+Authorization Model (Who Can Do What)
+Device Token (FCM) — Registration & Usage
+API Endpoint Reference for Frontend Clients
+WebSocket Authentication (Realtime Gateway)
+Multi-Platform Considerations (Android / PWA / Website)
+Rate Limiting
+Security Headers & CORS
+Error Codes & Handling
+Complete Flow Diagrams
+1. Architecture Overview
+The backend is a monolithic FastAPI application (mega_gateway.py) that runs 7 microservices in a single uvicorn process. Routing is done by URL path prefix:
+
+Path Prefix	Service	Auth Required
+/api/v1/auth/*	auth-service	❌ (register/verify) ✅ (logout, device-token, preferences)
+/api/v1/stops, /api/v1/routes, /api/v1/latest, /api/v1/trip_state, /api/v1/eta	tracking-service	❌ Public (read-only)
+/api/v1/ws/bus	realtime-gateway	✅ JWT via query param
+/api/v1/notifications/*	notification-api	✅ JWT Bearer
+/api/v1/suggestion	notification-api	✅ JWT Bearer
+/api/v1/admin/*	admin-service	✅ Admin JWT / X-Admin-Token
+/api/v1/gps/*, /api/v1/ws/device	gps-ingestion	✅ GPS_API_KEY (hardware only)
+/api/v1/ml/*	eta-ml-service	Internal only
+Base URL: https://<DOMAIN>/api/v1/
+
+2. Authentication Flow (OTP + JWT)
+The system uses passwordless OTP-based email authentication. There are no passwords, no OAuth, no social login.
+
+Step-by-Step Flow
+SMTP Server
+PostgreSQL
+Auth Service
+Android App
+SMTP Server
+PostgreSQL
+Auth Service
+Android App
+User checks email, gets 6-digit OTP
+Store access_token securely (SharedPreferences / EncryptedStorage)
+POST /api/v1/auth/register {name, email, boarding_stop_id?}
+Create/update user, store HMAC(OTP)
+Send OTP email (background task)
+202 {"message": "If this email is regis
+<truncated 21001 bytes>
+                                                     │
+│ FCM:       PUT /api/v1/auth/device-token                   │
+│            Body: {device_token, notifications_on}          │
+│            Call after login + on onNewToken()               │
+│                                                            │
+│ Prefs:     PATCH /api/v1/auth/preferences                  │
+│            Body: {proximity_alert_enabled?,                 │
+│                   boarding_alert_stop_id?,                  │
+│                   destination_alert_stop_id?,               │
+│                   notifications_on?}                        │
+│                                                            │
+│ WebSocket: wss://domain/api/v1/ws/bus?token=<JWT>          │
+│            Close codes: 4003=Forbidden, 4001=Revoked       │
+│                                                            │
+│ Alt Live:  Firebase RTDB @ "live_bus" (lat/lon/speed)       │
+│                                                            │
+│ Public:    /stops, /routes, /latest, /trip_state, /eta      │
+│            (no auth needed)                                 │
+└──────────────────────────────────────────────────────────┘
+this is a fullr eport from the backend us eit as needed
+
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-10-17T03:00:41+05:30.
+
+The user's current state is as follows:
+Active Document: c:\Users\khais\Documents\GitHub\DUK-BusTracker\frontend\android\app\src\main\java\com\bustracker\MainActivity.kt (LANGUAGE_KOTLIN)
+Cursor is on line: 1
+Other open documents:
+- c:\Users\khais\Documents\GitHub\DUK-BusTracker\frontend\android\app\src\main\java\com\bustracker\MainActivity.kt (LANGUAGE_KOTLIN)
+- c:\Users\khais\Documents\GitHub\DUK-BusTracker\frontend\src\screens\ProfileSetupScreen.tsx (LANGUAGE_TSX)
+</ADDITIONAL_METADATA>
