@@ -11,6 +11,7 @@ import httpx
 import logging
 import math
 import os
+import sys
 import uuid
 import numpy as np
 from datetime import datetime, timezone, timedelta
@@ -62,6 +63,8 @@ TRAIN_INTERVAL = os.environ.get("TRAIN_INTERVAL", "weekly").lower()
 MIN_TRIPS = int(os.environ.get("MIN_TRIPS", "5"))
 # Minimum GPS points required to trigger training (default 100)
 MIN_GPS_ROWS = int(os.environ.get("MIN_GPS_ROWS", "100"))
+# Model MAE must be below baseline MAE × this factor to be saved (0.9 = ≥10% better).
+ML_MIN_GAIN = float(os.environ.get("ML_MIN_GAIN", "0.9"))
 
 engine = create_async_engine(DATABASE_URL)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -419,7 +422,16 @@ async def run_training():
     predictions = model.predict(X_test)
     mae = mean_absolute_error(y_test, predictions)
     mse = mean_squared_error(y_test, predictions)
-    logger.info("[ML] Model Evaluation - MAE: %.2f minutes", mae)
+    # Baseline the model has to beat: the distance-based estimate it gets as
+    # feature 7 (straight-line km at 25 km/h × bus factor). A model that can't
+    # beat it is not worth serving — keep the current model / OSRM fallback.
+    baseline_mae = mean_absolute_error(y_test, X_test[:, 7])
+    logger.info("[ML] Model Evaluation - MAE: %.2f min (distance baseline %.2f min, %d test rows)",
+                mae, baseline_mae, len(y_test))
+    if mae >= baseline_mae * ML_MIN_GAIN:
+        logger.warning("[ML] Model not better than baseline (needs MAE < %.2f) — NOT saved.",
+                       baseline_mae * ML_MIN_GAIN)
+        return
 
     # Save ONNX model directly to disk first
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -521,9 +533,18 @@ async def weekly_training_loop(redis: Redis):
 
 
 async def main():
-    logger.info("[ML] Training job starting. Running on weekly schedule.")
-    
     redis = Redis.from_url(REDIS_URL)
+    if "--now" in sys.argv:
+        # One-off run (first model, or after fixing data):
+        #   python services/ml-training-job/train_job.py --now
+        logger.info("[ML] Manual training run (--now).")
+        try:
+            await _attempt_training(redis, "ml:training:lock", 600)
+        finally:
+            await redis.aclose()
+        return
+
+    logger.info("[ML] Training job starting. Running on weekly schedule.")
     
     # Start the weekly schedule loop in the background (or foreground)
     # We await it directly so the script stays alive forever
