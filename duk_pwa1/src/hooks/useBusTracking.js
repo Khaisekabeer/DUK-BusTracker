@@ -16,6 +16,8 @@ const LIGHT_POLL_MS = 30000;  // 30 s  — reduced when WS is providing GPS data
 // Module-level route geometry cache: fetched once per app session.
 // Stored outside React state so it survives component unmounts.
 let _cachedRouteGeometry = {};
+// Stable empty value so "no planned route" compares equal across polls.
+const NO_PLANNED_ROUTE = [];
 
 function getProximityLocationName(lon, lat, defaultName, stops) {
   if (!stops || stops.length === 0) return defaultName;
@@ -168,23 +170,25 @@ export default function useBusTracking() {
         updates.mlEtas = null;
       }
 
-      // Route Geometry — fetched once per trip (or per direction when no trip
-      // is running, so the planned line still shows while waiting / idle).
+      // Route Geometry — only during trip time: a scheduled trip that is
+      // connecting or running. Outside it the bus may be on an unscheduled run,
+      // where showing (and snapping to) the fixed route would be wrong.
       const currentTripId = trip?.trip_id;
-      const geoDir = (trip?.direction === 'forward' || trip?.direction === 'reverse')
-        ? trip.direction
-        : (trip?.trip || '').toLowerCase().includes('morning') ? 'forward'
-        : (trip?.trip || '').toLowerCase().includes('evening') ? 'reverse'
-        : new Date().getHours() >= 14 ? 'reverse' : 'forward';
-      const geoKey = currentTripId ? `trip:${currentTripId}` : `dir:${geoDir}`;
-      if (!_cachedRouteGeometry[geoKey]) {
-        try {
-          const geo = await getRouteGeometry(currentTripId || null, geoDir);
-          if (geo?.coordinates?.length) _cachedRouteGeometry[geoKey] = geo.coordinates;
-        } catch (_) { }
+      const inTripTime = !!currentTripId
+        && ['active', 'on_trip', 'late', 'connecting'].includes(trip?.status)
+        && !(trip?.trip || '').toLowerCase().includes('unscheduled');
+      let planned = NO_PLANNED_ROUTE;
+      if (inTripTime) {
+        const geoKey = `trip:${currentTripId}`;
+        if (!_cachedRouteGeometry[geoKey]) {
+          try {
+            const geo = await getRouteGeometry(currentTripId, trip.direction || null);
+            if (geo?.coordinates?.length) _cachedRouteGeometry[geoKey] = geo.coordinates;
+          } catch (_) { }
+        }
+        planned = _cachedRouteGeometry[geoKey] || NO_PLANNED_ROUTE;
       }
-      const planned = _cachedRouteGeometry[geoKey];
-      if (planned && plannedSentRef.current !== planned) {
+      if (plannedSentRef.current !== planned) {
         plannedSentRef.current = planned;
         updates.plannedCoords = planned;
         // Notify BusMapView's TrailManager so it can snap-to-route instantly

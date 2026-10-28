@@ -287,9 +287,10 @@ export default function BusMapView({
       });
     }
     // Feed the snapper straight from props too (the window event can fire
-    // before this map mounts). setPlannedRoute ignores an unchanged line.
-    if (trailManagerRef.current && planned && planned.length > 0) {
-      trailManagerRef.current.setPlannedRoute(planned);
+    // before this map mounts). setPlannedRoute ignores an unchanged line, and
+    // an empty one (no trip / unscheduled) stops snapping to the fixed route.
+    if (trailManagerRef.current) {
+      trailManagerRef.current.setPlannedRoute(planned || []);
     }
     const stopsSrc = map.getSource('stops');
     if (stopsSrc) {

@@ -597,7 +597,7 @@ export default function RouteView() {
               onAutoCenterChange={setAutoCenter}
               headingStatus={headingStatus}
               stops={stops}
-              plannedCoords={plannedCoords}
+              plannedCoords={isActive && !isUnscheduled ? plannedCoords : []}
               routeHistoryCoords={displayHistoryCoords}
               onStopClick={(s) => setSelectedStop(s)}
               onMapLoad={(map) => { 
