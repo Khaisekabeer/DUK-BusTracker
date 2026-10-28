@@ -72,7 +72,12 @@ def send_fcm_notification_task(
         if not tokens:
             return {"success": 0, "failure": 0}
 
-        from firebase_helper import send_multicast_message
+        # Import from the shared lib (on PYTHONPATH), not the local
+        # firebase_helper shim: Celery only puts its cwd on sys.path while it
+        # loads the app, so a lazy `from firebase_helper import ...` raised
+        # ModuleNotFoundError at send time and EVERY push from this worker
+        # (proximity, trip started, delay) failed after 3 retries.
+        from libs.duk_common.firebase_app import send_multicast_message
 
         response = send_multicast_message(tokens, title, body, data)
         logger.info(

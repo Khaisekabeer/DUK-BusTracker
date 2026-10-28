@@ -31,6 +31,7 @@ Endpoints:
 """
 import asyncio
 import html as html_mod
+import json
 import logging
 import os
 import sys
@@ -48,7 +49,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from libs.duk_common.settings import get_settings
 from libs.duk_common.redis_client import get_redis, redis_lock
-from libs.duk_common.events import TripStatusChangedEvent, EventBus
+from libs.duk_common.events import TripStatusChangedEvent, TripStartedEvent, EventBus
 from libs.duk_common.cache.stops_cache import invalidate_stops_cache
 from libs.duk_common.audit_logger import record_audit_event
 from libs.duk_common.constants import normalize_direction, MORNING_END_MINS, EVENING_END_MINS
@@ -258,8 +259,24 @@ async def _broadcast_to_all_users(db: AsyncSession, title: str, body: str, data:
         db.add(notif)
         await db.commit()
 
+        # Live toast for open apps over the passenger WebSocket. This also
+        # reaches users who never granted push permission (e.g. iOS Safari
+        # without the PWA installed). The PWA de-duplicates against FCM.
+        try:
+            redis = await get_redis()
+            await redis.publish("bus:broadcast", json.dumps({
+                "type": "announcement", "event": "announcement",
+                "kind": (data or {}).get("type", "admin_broadcast"),
+                "id": notif.id, "title": title, "body": body,
+            }))
+        except Exception as e:
+            logger.warning("[ADMIN] Live announcement publish failed: %s", e)
+
+        # Carry the in-app row id so the PWA can de-duplicate the push against
+        # the live WebSocket copy and the drawer history.
+        push_data = {**(data or {}), "id": str(notif.id)}
         # FIX: send_multicast_chunked is async — must be awaited
-        sent_count, failed_count = await send_multicast_chunked(tokens, title, body, data)
+        sent_count, failed_count = await send_multicast_chunked(tokens, title, body, push_data)
 
         broadcast = AdminBroadcast(title=title, body=body, sent_count=sent_count, success=True)
         db.add(broadcast)
@@ -551,8 +568,15 @@ async def start_trip(
     try:
         redis = await get_redis()
         await redis.publish("bus:trip_start", f'{{"trip_id": {trip.id}, "direction": "{direction}"}}')
+        # Nothing subscribes to bus:trip_start — notification-service listens on
+        # the notifications.trip_started stream, so admin-started trips never
+        # sent the "trip started" push / in-app entry. Publish it there too.
+        await EventBus(redis).publish(
+            "notifications.trip_started",
+            TripStartedEvent(trip_id=trip.id, direction=normalize_direction(direction)),
+        )
     except Exception as e:
-        logger.debug("[ADMIN] Redis trip_start publish failed: %s", e)
+        logger.warning("[ADMIN] trip_start publish failed: %s", e)
 
     await record_audit_event(
         db=db,

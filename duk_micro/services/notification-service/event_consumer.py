@@ -59,7 +59,12 @@ async def handle_proximity_alert(event: ProximityAlertEvent):
             title = "Destination Approaching!"
             body  = f"Your bus is nearing {stop_name}. Please gather your belongings and prepare to alight."
 
-        send_fcm_notification_task.delay(tokens, title, body, {"trip_id": str(trip_id)})
+        # type/stop_id drive the web-push tag, so repeat alerts for one stop
+        # collapse instead of stacking (see firebase_app.send_multicast_message).
+        send_fcm_notification_task.delay(tokens, title, body, {
+            "trip_id": str(trip_id), "type": "proximity",
+            "alert_type": alert_type, "stop_id": str(event.stop_id),
+        })
     except Exception as e:
         logger.exception("[NOTIF] handle_proximity_alert crashed: %s", e)
 
@@ -109,7 +114,7 @@ async def handle_trip_started(event: TripStartedEvent):
         trip_id   = event.trip_id
         direction = event.direction
 
-        dir_str = "Morning" if direction == "forward" else "Evening"
+        dir_str = "Morning" if direction == "forward" else "Evening" if direction == "reverse" else "Bus"
         title   = f"{dir_str} Bus Trip Started!"
         body    = "The bus is now on the move. Tap to track it live in the app."
 

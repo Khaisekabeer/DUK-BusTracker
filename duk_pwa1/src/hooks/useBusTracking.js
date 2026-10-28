@@ -253,6 +253,11 @@ export default function useBusTracking() {
         if (!isMounted) return;
         try {
           const msg = JSON.parse(event.data);
+          if (msg.type === 'announcement') {
+            // Admin announcement on the shared broadcast channel → App toast/drawer.
+            window.dispatchEvent(new CustomEvent('live-announcement', { detail: msg }));
+            return;
+          }
           if (Number.isFinite(msg.lat) && Number.isFinite(msg.lon)) {
             let newLocationName = msg.location_name || null;
             if (stopsRef.current && stopsRef.current.length > 0) {

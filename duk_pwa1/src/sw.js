@@ -112,7 +112,9 @@ self.addEventListener('notificationclick', (event) => {
         }
       }
 
-      return clients.openWindow('/route');
+      // App uses HashRouter under the SW scope (/bus/ios/mobile/), so a bare
+      // '/route' pointed outside the app.
+      return clients.openWindow(new URL('#/route', self.registration.scope).href);
     })
   );
 });

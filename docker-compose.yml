@@ -150,6 +150,9 @@ services:
       - ./duk_micro/.env
     environment:
       - REDIS_URL=redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379/0
+      # trip-lifecycle needs OSRM (start/stop geofence, proximity, delay ETA);
+      # without this it fell back to 127.0.0.1:5001 and every call failed.
+      - OSRM_URL=http://osrm-backend:5000
     depends_on:
       - postgres
       - redis

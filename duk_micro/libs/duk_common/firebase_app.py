@@ -114,6 +114,7 @@ async def send_multicast_chunked(
             apns=messaging.APNSConfig(
                 payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))
             ),
+            webpush=_webpush_config({k: str(v) for k, v in (data or {}).items()}),
         )
         try:
             resp = await loop.run_in_executor(None, messaging.send_each_for_multicast, msg)
@@ -134,11 +135,13 @@ def send_multicast_message(tokens: list[str], title: str, body: str, data: dict 
         class _MockResponse:
             success_count = 0
             failure_count = len(tokens)
+            responses = []  # callers iterate this to purge dead tokens
         return _MockResponse()
 
+    data = {k: str(v) for k, v in (data or {}).items()}
     message = messaging.MulticastMessage(
         notification=messaging.Notification(title=title, body=body),
-        data=data or {},
+        data=data,
         tokens=tokens,
         android=messaging.AndroidConfig(
             notification=messaging.AndroidNotification(default_sound=True)
@@ -146,5 +149,41 @@ def send_multicast_message(tokens: list[str], title: str, body: str, data: dict 
         apns=messaging.APNSConfig(
             payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))
         ),
+        webpush=_webpush_config(data),
     )
     return messaging.send_each_for_multicast(message)
+
+
+def _push_tag(data: dict) -> str:
+    """Collapse key for a notification: one per stop for proximity alerts, one
+    per type otherwise, so a re-sent alert replaces instead of stacking."""
+    ntype = data.get("type") or "duk-bus"
+    if ntype == "proximity":
+        return f"proximity-{data.get('stop_id') or 'stop'}"
+    return ntype
+
+
+def _webpush_config(data: dict) -> "messaging.WebpushConfig":
+    """Web push display options. Messages carry a `notification` block, so the
+    browser shows them itself and the service worker's own showNotification
+    path (with tag/vibrate) never runs — these options must travel with the
+    message instead."""
+    base = os.environ.get("PWA_BASE_PATH", "/bus/ios/mobile/")
+    if not base.endswith("/"):
+        base += "/"
+    # FCM requires an absolute https:// click link; without a configured public
+    # URL we omit it and the service worker's notificationclick handles taps.
+    public_url = os.environ.get("PWA_PUBLIC_URL", "").strip()
+    fcm_options = None
+    if public_url.startswith("https://"):
+        fcm_options = messaging.WebpushFCMOptions(link=public_url.rstrip("/") + "/#/route")
+    return messaging.WebpushConfig(
+        notification=messaging.WebpushNotification(
+            icon=f"{base}icon-192.png",
+            badge=f"{base}icon-192.png",
+            tag=_push_tag(data),
+            renotify=data.get("type") in ("proximity", "late_eta"),
+            vibrate=[200, 100, 200],
+        ),
+        fcm_options=fcm_options,
+    )

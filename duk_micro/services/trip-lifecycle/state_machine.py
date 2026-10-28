@@ -180,7 +180,9 @@ async def get_active_trip(db: AsyncSession, now_ist: datetime, bus_id: int) -> O
 
 async def _notify_trip_started_event(bus: EventBus, trip: Trip) -> None:
     """Publish TripStartedEvent so notification-service fans out FCM + in-app."""
-    ev = TripStartedEvent(trip_id=trip.id, direction=trip.direction)
+    # The event schema only accepts forward/reverse; alias strings ("evening")
+    # made the constructor raise and silently drop the trip-started push.
+    ev = TripStartedEvent(trip_id=trip.id, direction=normalize_direction(trip.direction))
     await bus.publish("notifications.trip_started", ev)
     logger.info("[LIFECYCLE] Published TripStartedEvent for trip #%d", trip.id)
 
@@ -240,8 +242,15 @@ async def _get_all_alert_tokens_bulk(db: AsyncSession, route_id: int, direction:
                 User, User.id == UserNotificationPreference.user_id
             ).where(
                 UserNotificationPreference.route_id == route_id,
-                UserNotificationPreference.direction == direction,
+                UserNotificationPreference.direction.in_(
+                    ["forward", "morning", "Morning", "m"] if normalize_direction(direction) == "forward"
+                    else ["reverse", "evening", "Evening", "e"]
+                ),
                 UserNotificationPreference.is_active == True,
+                # Same eligibility as the users-table path: a user who turned
+                # notifications off must not get proximity pushes via this table.
+                User.verified == True,
+                User.notifications_on != False,
                 User.device_token.isnot(None)
             )
         )
@@ -287,6 +296,17 @@ async def run_proximity_alerts(
     """
     boarding_map, dest_map = await _get_all_alert_tokens_bulk(db, trip.route_id, trip.direction)
 
+    # Alert stops are not direction-specific, so the same stop is the origin on
+    # one trip and the destination on the other. "Approaching your drop-off"
+    # as the bus *leaves* its origin (or "head to the stop to board" at the
+    # final stop) is wrong — skip those two impossible combinations.
+    origin_id = dest_id = None
+    try:
+        origin_id = (await get_start_stop(db, trip.direction, trip.route_id)).id
+        dest_id = (await get_destination_stop(db, trip.direction, trip.route_id)).id
+    except ValueError:
+        pass
+
     candidate_stops = []
     for stop in stops:
         if stop["route_id"] != trip.route_id:
@@ -315,8 +335,8 @@ async def run_proximity_alerts(
         stop_name = stop.get("name", "your stop")
         state_key = f"trip:{trip.id}:stop:{stop_id}:notified"
 
-        boarding_tokens = list(boarding_map.get(stop_id, []))
-        dest_tokens     = list(dest_map.get(stop_id, []))
+        boarding_tokens = [] if stop_id == dest_id else list(boarding_map.get(stop_id, []))
+        dest_tokens     = [] if stop_id == origin_id else list(dest_map.get(stop_id, []))
 
         if boarding_tokens:
             await bus.publish(
@@ -351,14 +371,23 @@ async def check_eta_late_notification(
     lon:      float,
     dest_lat: float,
     dest_lon: float,
+    dest_sched_mins: int = 0,
 ) -> None:
-    """Fire tiered notifications when bus is > 10 min late vs scheduled end."""
+    """Fire tiered notifications when the bus will reach its destination > 10 min
+    after the destination stop's scheduled time."""
     duration_s   = await get_osrm_duration_s(lat, lon, dest_lat, dest_lon)
     eta_min      = (duration_s / 60.0) * BUS_FACTOR
     now_ist      = datetime.now(timezone.utc).astimezone(IST)
     time_mins    = now_ist.hour * 60 + now_ist.minute
-    sched_end    = MORNING_END_MINS if normalize_direction(trip.direction) == "forward" else EVENING_END_MINS
-    expected_end = sched_end - 30  # expected arrival is 30 min before window close
+    # Compare against the destination's *scheduled arrival* (e.g. 08:45 AM).
+    # The old baseline was the start-window close minus 30 min (10:30 / 20:00),
+    # 1–2 h after the real arrival, so a bus had to be ~100 min late before any
+    # "Bus Delayed" alert fired.
+    if dest_sched_mins > 0:
+        expected_end = dest_sched_mins
+    else:
+        sched_end    = MORNING_END_MINS if normalize_direction(trip.direction) == "forward" else EVENING_END_MINS
+        expected_end = sched_end - 30
     eta_arrival  = time_mins + eta_min
     delay_min    = eta_arrival - expected_end
 
@@ -395,7 +424,7 @@ async def check_eta_late_notification(
                 delay_min=round(delay_min, 1),
                 eta_min=round(eta_min, 1),
                 arrival_str=arrival_str,
-                direction=trip.direction,
+                direction=normalize_direction(trip.direction),
                 user_tokens=tokens,
             ),
         )
@@ -695,7 +724,10 @@ async def process_gps_event(event_data: dict, db: AsyncSession, redis: Redis, bu
             logger.warning("[LIFECYCLE] update_visited_stops failed: %s", exc)
 
         try:
-            await check_eta_late_notification(db, bus, redis, trip, lat, lon, dest_lat, dest_lon)
+            dest_sched = parse_time_to_minutes(
+                dest_stop.morning_time if normalize_direction(trip.direction) == "forward" else dest_stop.evening_time
+            )
+            await check_eta_late_notification(db, bus, redis, trip, lat, lon, dest_lat, dest_lon, dest_sched)
         except Exception as exc:
             logger.warning("[LIFECYCLE] check_eta_late_notification failed: %s", exc)
 

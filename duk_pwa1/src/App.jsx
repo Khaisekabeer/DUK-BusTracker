@@ -2,7 +2,7 @@
  * App.jsx — DUK Bus Tracker PWA 2
  * Universal device support. Unified Route+Map toggle view.
  */
-import React, { useState, useCallback, createContext, useContext, useEffect, lazy, Suspense } from 'react';
+import React, { useState, useCallback, createContext, useContext, useEffect, useRef, lazy, Suspense } from 'react';
 import { HashRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 
 import { getToken, clearSession, getUser } from './storage';
@@ -233,6 +233,22 @@ function NotificationProvider({ children }) {
     localStorage.setItem('last_read_time', Date.now().toString());
   }, []);
 
+  // The same announcement can arrive twice while the app is open: as an FCM
+  // foreground message and over the live WebSocket. Show one toast per id (or
+  // per title+body when there is no id) within a short window.
+  const recentToastsRef = useRef(new Map());
+  const showLiveNotification = useCallback((msg) => {
+    if (!msg || !msg.title) return;
+    const key = msg.data?.id ? `id:${msg.data.id}` : `t:${msg.title}|${msg.body || ''}`;
+    const now = Date.now();
+    const seen = recentToastsRef.current;
+    for (const [k, t] of seen) if (now - t > 120000) seen.delete(k);
+    if (seen.has(key)) return;
+    seen.set(key, now);
+    addNotification(msg);
+    showToast(msg.title, 'info');
+  }, [addNotification, showToast]);
+
   // Foreground push only matters once there's an FCM token, i.e. after login,
   // so logged-out visitors never download Firebase.
   useEffect(() => {
@@ -241,13 +257,25 @@ function NotificationProvider({ children }) {
     let cancelled = false;
     loadFirebaseAfterLoad().then(({ onForegroundMessage }) => {
       if (cancelled) return;
-      unsub = onForegroundMessage((msg) => {
-        addNotification(msg);
-        if (msg && msg.title) showToast(msg.title, 'info');
-      });
+      unsub = onForegroundMessage(showLiveNotification);
     }).catch(() => { });
     return () => { cancelled = true; unsub(); };
-  }, [isAuthed, addNotification, showToast]);
+  }, [isAuthed, showLiveNotification]);
+
+  // Announcements pushed over the passenger WebSocket (useBusTracking relays
+  // them) — reaches users without push permission too.
+  useEffect(() => {
+    if (!isAuthed) return;
+    const onAnnouncement = (e) => {
+      const m = e.detail || {};
+      showLiveNotification({
+        title: m.title, body: m.body || '',
+        data: { id: m.id != null ? String(m.id) : undefined, type: m.kind || 'admin_broadcast' },
+      });
+    };
+    window.addEventListener('live-announcement', onAnnouncement);
+    return () => window.removeEventListener('live-announcement', onAnnouncement);
+  }, [isAuthed, showLiveNotification]);
 
   const checkNotifications = useCallback(() => {
     const token = getToken();

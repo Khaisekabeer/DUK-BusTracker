@@ -175,6 +175,9 @@ class UpdateProfileRequest(BaseModel):
 
 
 class ProximityPrefsRequest(BaseModel):
+    # Settings → "My stop" saves through this endpoint; without the field the
+    # change was silently dropped and only lived in the browser.
+    boarding_stop_id: Optional[int] = None
     proximity_alert_enabled: Optional[bool] = None
     boarding_alert_stop_id: Optional[int] = None
     destination_alert_stop_id: Optional[int] = None
@@ -594,6 +597,11 @@ async def update_preferences(
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
+
+    if req.boarding_stop_id is not None:
+        stop_result = await db.execute(select(BusStop).where(BusStop.id == req.boarding_stop_id))
+        if not stop_result.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Invalid boarding stop.")
 
     if req.boarding_alert_stop_id is not None:
         stop_result = await db.execute(select(BusStop).where(BusStop.id == req.boarding_alert_stop_id))
