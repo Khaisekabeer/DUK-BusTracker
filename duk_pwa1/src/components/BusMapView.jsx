@@ -2,12 +2,13 @@ import React, { useEffect, useRef } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import GPSAnimator from '../utils/gpsAnimator';
-import TrailManager, { SNAP_THRESHOLD_M } from '../utils/trailManager';
+import TrailManager from '../utils/trailManager';
 import { getRouteSegment } from '../api';
 
 const MAP_STYLE     = 'https://tiles.openfreemap.org/styles/liberty';
 const TRAIL_COLOR   = '#2563eb';
-const PLANNED_COLOR = '#94a3b8';
+const PLANNED_COLOR = '#64748b';
+const GESTURE_GRACE_MS = 1500; // keep follow paused this long after the finger lifts
 
 export default function BusMapView({
   interactive   = true,
@@ -49,6 +50,10 @@ export default function BusMapView({
   const userInteractingRef = useRef(false);
   const onAutoCenterChangeRef = useRef(onAutoCenterChange);
   useEffect(() => { onAutoCenterChangeRef.current = onAutoCenterChange; }, [onAutoCenterChange]);
+  // Latest data props for the map 'load' handler (the mount-time closure would
+  // otherwise draw whatever was there at mount — often nothing).
+  const latestDataRef = useRef({ plannedCoords, stops, routeHistoryCoords });
+  latestDataRef.current = { plannedCoords, stops, routeHistoryCoords };
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
@@ -73,28 +78,59 @@ export default function BusMapView({
     mapRef.current = map;
     trailManagerRef.current = new TrailManager();
 
-    // A user-initiated pan/zoom/rotate carries an `originalEvent` (programmatic
-    // moves like our follow-setCenter do not). On such a gesture we release
-    // auto-follow so the map stays where the user put it, and tell the parent so
-    // the crosshair button reflects the change. We also suppress the per-frame
-    // follow for the duration of the gesture.
-    const onUserGestureStart = (e) => {
-      if (!e || !e.originalEvent) return;
-      userInteractingRef.current = true;
+    // Gesture handling. The per-frame follow calls setCenter → jumpTo → stop(),
+    // which cancels MapLibre's gesture handlers. Waiting for 'dragstart' is too
+    // late: the drag is killed before it reaches its start threshold, so the
+    // map felt locked. So we pause follow the moment a finger/mouse goes down
+    // on the map, release follow as soon as it actually moves (or pinches /
+    // wheels), and only the crosshair button turns follow back on.
+    let graceTimer = null;
+    let downAt = null;
+    const releaseFollow = () => {
       if (autoCenterRef.current) {
         autoCenterRef.current = false;
         if (onAutoCenterChangeRef.current) onAutoCenterChangeRef.current(false);
       }
     };
-    const onUserGestureEnd = (e) => {
-      if (e && e.originalEvent) userInteractingRef.current = false;
+    const beginInteract = () => {
+      if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+      userInteractingRef.current = true;
     };
+    const endInteract = () => {
+      downAt = null;
+      if (graceTimer) clearTimeout(graceTimer);
+      graceTimer = setTimeout(() => { userInteractingRef.current = false; graceTimer = null; }, GESTURE_GRACE_MS);
+    };
+    const canvasEl = map.getCanvasContainer();
+    const onPointerDown = (e) => { beginInteract(); downAt = [e.clientX, e.clientY]; };
+    const onPointerMove = (e) => {
+      if (!downAt) return;
+      if (Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 6) releaseFollow();
+    };
+    const onTouchStart = (e) => { beginInteract(); if (e.touches && e.touches.length > 1) releaseFollow(); };
+    const onWheel = () => { beginInteract(); releaseFollow(); endInteract(); };
+    canvasEl.addEventListener('pointerdown', onPointerDown, { passive: true });
+    canvasEl.addEventListener('pointermove', onPointerMove, { passive: true });
+    canvasEl.addEventListener('touchstart', onTouchStart, { passive: true });
+    canvasEl.addEventListener('wheel', onWheel, { passive: true });
+    window.addEventListener('pointerup', endInteract);
+    window.addEventListener('pointercancel', endInteract);
+    window.addEventListener('touchend', endInteract);
+    // Belt and braces: any MapLibre user gesture also releases follow.
+    const onUserGestureStart = (e) => {
+      if (!e || !e.originalEvent) return;
+      beginInteract();
+      releaseFollow();
+    };
+    const onUserGestureEnd = (e) => { if (e && e.originalEvent) endInteract(); };
     map.on('dragstart', onUserGestureStart);
     map.on('zoomstart', onUserGestureStart);
     map.on('rotatestart', onUserGestureStart);
+    map.on('pitchstart', onUserGestureStart);
     map.on('dragend', onUserGestureEnd);
     map.on('zoomend', onUserGestureEnd);
     map.on('rotateend', onUserGestureEnd);
+    map.on('pitchend', onUserGestureEnd);
 
     map.on('load', () => {
       mapReadyRef.current = true;
@@ -108,7 +144,7 @@ export default function BusMapView({
       map.addLayer({
         id: 'planned-route-layer', type: 'line', source: 'planned-route',
         layout: { 'line-cap': 'round', 'line-join': 'round' },
-        paint: { 'line-color': PLANNED_COLOR, 'line-width': 2.5, 'line-opacity': 0.5 },
+        paint: { 'line-color': PLANNED_COLOR, 'line-width': 4, 'line-opacity': 0.55, 'line-dasharray': [2, 1.5] },
       });
 
       map.addSource('trail', {
@@ -147,7 +183,8 @@ export default function BusMapView({
         });
       }
 
-      updateMapData(map, plannedCoords, stops, routeHistoryCoords);
+      const d = latestDataRef.current;
+      updateMapData(map, d.plannedCoords, d.stops, d.routeHistoryCoords);
     });
 
     // Initialize Animator with smart snap-to-route segment fetcher.
@@ -162,7 +199,8 @@ export default function BusMapView({
           autoCenterRef.current &&
           isLiveRef.current &&
           !userInteractingRef.current &&
-          mapRef.current
+          mapRef.current &&
+          !mapRef.current.isEasing()
         ) {
           mapRef.current.setCenter(point);
         }
@@ -175,40 +213,19 @@ export default function BusMapView({
           trailManagerRef.current.commitSegment(path);
         }
       },
+      // A teleport (long gap / reconnect) leaves a hole in the live trail —
+      // ask for the server history so the hole is filled from trip_trace.
+      onJump: () => window.dispatchEvent(new CustomEvent('trail-resync')),
       segmentFetcher: async (lat1, lon1, lat2, lon2) => {
         const trail = trailManagerRef.current;
-        const hasPlanned = trail && trail._plannedCoords && trail._plannedCoords.length > 0;
-
-        if (hasPlanned) {
-          // Try snapping both endpoints to the planned route
-          const snap1 = trail.findNearestOnRoute(lon1, lat1);
-          const snap2 = trail.findNearestOnRoute(lon2, lat2);
-
-          if (
-            snap1 && snap2 &&
-            snap1.distM <= SNAP_THRESHOLD_M &&
-            snap2.distM <= SNAP_THRESHOLD_M
-          ) {
-            // Bus is on the known route — return planned route slice instantly (no OSRM).
-            // Only treat as genuinely backward if the snap index clearly regressed by
-            // >= 3 waypoints — smaller diffs are GPS jitter at a stop and reversing
-            // them is what makes the marker briefly "back up" along the route.
-            const idxDiff = snap1.idx - snap2.idx;
-            const isBackward = idxDiff >= 3;
-            const from = Math.min(snap1.idx, snap2.idx);
-            const to   = Math.max(snap1.idx, snap2.idx);
-            let slice = trail._plannedCoords.slice(from, to + 1);
-            
-            if (isBackward) {
-              slice.reverse();
-            }
-            
-            if (slice.length >= 2) return slice;
-          }
-          // Deviated beyond threshold — fall through to OSRM
+        if (trail && trail.hasPlanned()) {
+          // Forward-only slice of the planned line. [] = on route but not moving
+          // forward (hold, never replay the road backwards); null = off route.
+          const slice = trail.sliceForLeg(lon1, lat1, lon2, lat2);
+          if (slice) return slice;
         }
 
-        // Unscheduled trip or deviated > 300m: use OSRM for accurate road shape
+        // Unscheduled trip or genuinely off the planned route: OSRM road shape
         const seg = await getRouteSegment(lat1, lon1, lat2, lon2);
         return seg?.coordinates || [];
       },
@@ -217,7 +234,7 @@ export default function BusMapView({
     const onLiveGps = (e) => {
       const msg = e.detail;
       if (animatorRef.current && msg.lat && msg.lon) {
-        animatorRef.current.pushPoint(msg.lat, msg.lon, msg.server_time, msg.osrm_path);
+        animatorRef.current.pushPoint(msg.lat, msg.lon, msg.server_time, msg.osrm_path, msg.speed_kmh);
       }
     };
     window.addEventListener('live-gps-update', onLiveGps);
@@ -232,6 +249,14 @@ export default function BusMapView({
     window.addEventListener('planned-route-ready', onPlannedRoute);
 
     return () => {
+      if (graceTimer) clearTimeout(graceTimer);
+      canvasEl.removeEventListener('pointerdown', onPointerDown);
+      canvasEl.removeEventListener('pointermove', onPointerMove);
+      canvasEl.removeEventListener('touchstart', onTouchStart);
+      canvasEl.removeEventListener('wheel', onWheel);
+      window.removeEventListener('pointerup', endInteract);
+      window.removeEventListener('pointercancel', endInteract);
+      window.removeEventListener('touchend', endInteract);
       window.removeEventListener('live-gps-update', onLiveGps);
       window.removeEventListener('planned-route-ready', onPlannedRoute);
       mapReadyRef.current = false;
@@ -250,15 +275,21 @@ export default function BusMapView({
   const updateMapData = (map, planned, stopsArr, historyCoords) => {
     if (!map || !mapReadyRef.current) return;
     const plannedSrc = map.getSource('planned-route');
-    if (plannedSrc && planned && planned.length > 0) {
-      const isMulti = Array.isArray(planned[0]) && Array.isArray(planned[0][0]);
-      plannedSrc.setData({ 
-        type: 'Feature', 
-        geometry: { 
-          type: isMulti ? 'MultiLineString' : 'LineString', 
-          coordinates: planned 
-        } 
+    if (plannedSrc) {
+      const has = planned && planned.length > 0;
+      const isMulti = has && Array.isArray(planned[0]) && Array.isArray(planned[0][0]);
+      plannedSrc.setData({
+        type: 'Feature',
+        geometry: {
+          type: isMulti ? 'MultiLineString' : 'LineString',
+          coordinates: has ? planned : []
+        }
       });
+    }
+    // Feed the snapper straight from props too (the window event can fire
+    // before this map mounts). setPlannedRoute ignores an unchanged line.
+    if (trailManagerRef.current && planned && planned.length > 0) {
+      trailManagerRef.current.setPlannedRoute(planned);
     }
     const stopsSrc = map.getSource('stops');
     if (stopsSrc) {
@@ -272,16 +303,10 @@ export default function BusMapView({
     }
 
     if (historyCoords && historyCoords.length > 0 && trailManagerRef.current) {
-      // Guard: only reseed from history if it has at least as many points as the
-      // current live trail. The route_history API is cached 30 s in Redis, so a
-      // poll response can arrive slightly behind the live segments commitSegment()
-      // just appended — blindly calling setHistory() would shrink the visible trail.
-      // When historyCoords is longer (or equal), it's safe to reseed because the
-      // DB has caught up and the history is more authoritative.
-      const currentLen = trailManagerRef.current.trailCoords.length;
-      if (historyCoords.length >= currentLen) {
-        trailManagerRef.current.setHistory(historyCoords);
-      }
+      // History (trip_trace) is authoritative from trip start; setHistory keeps
+      // any newer live legs on the end. No length comparison: point counts of
+      // the DB trail and the animated trail are not comparable.
+      trailManagerRef.current.setHistory(historyCoords);
     }
   };
 
@@ -350,9 +375,10 @@ export default function BusMapView({
   // Sync isActiveTrip prop into a ref so animator callbacks always read the latest value
   useEffect(() => {
     isActiveTripRef.current = isActiveTrip;
-    // When trip goes inactive, clear any live trail segments that were drawn
+    // When trip goes inactive, clear the drawn trail — but keep the planned
+    // route (clear() used to wipe it, so the snapper lost the route).
     if (!isActiveTrip && trailManagerRef.current) {
-      trailManagerRef.current.clear();
+      trailManagerRef.current.clearTrail();
     }
   }, [isActiveTrip]);
 

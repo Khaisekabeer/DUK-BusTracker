@@ -98,12 +98,27 @@ def _project_to_segment(
     return foot_lat, foot_lon, t, perp_m
 
 
+def _bearing_deg(la1: float, lo1: float, la2: float, lo2: float) -> float:
+    """Initial bearing a→b in degrees [0, 360)."""
+    p1, p2 = math.radians(la1), math.radians(la2)
+    dl = math.radians(lo2 - lo1)
+    x = math.sin(dl) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+
+def _angle_diff(a: float, b: float) -> float:
+    d = abs(a - b) % 360.0
+    return 360.0 - d if d > 180.0 else d
+
+
 def snap_to_route(
     lat: float, lon: float,
     index: Dict[str, Any],
     s_last: Optional[float],
     max_back_m: float = 40.0,
     max_fwd_m: float = 250.0,
+    heading: Optional[float] = None,
 ) -> Optional[Tuple[float, float, float, float]]:
     """
     Project a GPS fix onto the route, constrained to move forward in ``s``.
@@ -115,6 +130,9 @@ def snap_to_route(
                     by searching the whole route.
         max_back_m: how far behind ``s_last`` a fix may snap (small, absorbs jitter).
         max_fwd_m:  how far ahead ``s_last`` a fix may snap (one headway of travel).
+        heading:    vehicle travel bearing (deg) if known. On a global search,
+                    segments pointing >90° away are skipped so an out-and-back
+                    route can't acquire onto the opposite arm.
 
     Returns:
         ``(snap_lat, snap_lon, s_new, perp_m)`` for the best in-window segment,
@@ -138,6 +156,9 @@ def snap_to_route(
             continue
         a_lat, a_lon = pts[i]
         b_lat, b_lon = pts[i + 1]
+        if heading is not None and s_last is None and seg_end_s - seg_start_s > 1.0:
+            if _angle_diff(heading, _bearing_deg(a_lat, a_lon, b_lat, b_lon)) > 90.0:
+                continue
         f_lat, f_lon, t, perp_m = _project_to_segment(lat, lon, a_lat, a_lon, b_lat, b_lon)
         s_new = seg_start_s + t * (seg_end_s - seg_start_s)
         if lo_s is not None and s_new < lo_s:
@@ -150,6 +171,9 @@ def snap_to_route(
     if best is None:
         # Window excluded every segment (e.g. a long GPS gap). Re-acquire globally.
         if s_last is not None:
+            return snap_to_route(lat, lon, index, None, max_back_m, max_fwd_m, heading)
+        if heading is not None:
+            # Heading filter removed everything (bad heading) — retry without it.
             return snap_to_route(lat, lon, index, None, max_back_m, max_fwd_m)
         return None
 
@@ -167,6 +191,8 @@ def apply_route_snap_stateless(
     max_back_m: float = 40.0,
     max_fwd_m: float = 250.0,
     s_ema_alpha: float = 0.6,
+    stationary_kmh: float = 2.5,
+    deadband_m: float = 10.0,
 ) -> Tuple[float, float, bool, dict]:
     """
     Forward-only route snap with off-route hysteresis. Pure function.
@@ -181,6 +207,9 @@ def apply_route_snap_stateless(
         off_route_hits: consecutive out-of-corridor fixes needed to flip off-route
                       (hysteresis — one stray fix never flips it).
         s_ema_alpha:  smoothing factor on progress ``s`` (higher = more responsive).
+        stationary_kmh / deadband_m: while reported speed is below
+                      ``stationary_kmh``, progress moves only if the fix is more
+                      than ``deadband_m`` ahead — GPS drift at a stop is held.
 
     Returns:
         ``(snap_lat, snap_lon, off_route, new_state)``.
@@ -191,17 +220,48 @@ def apply_route_snap_stateless(
     s_last = state.get("s")
     hits = state.get("off_route_hits", 0)
 
+    # Travel heading from the last fix that is far enough away to be real motion.
+    heading = state.get("heading")
+    lf = state.get("last_fix")
+    if lf and _haversine_m(lf[0], lf[1], f_lat, f_lon) >= 15.0:
+        heading = _bearing_deg(lf[0], lf[1], f_lat, f_lon)
+        new_state["heading"] = heading
+        new_state["last_fix"] = [f_lat, f_lon]
+    elif not lf:
+        new_state["last_fix"] = [f_lat, f_lon]
+
     if not index.get("pts"):
         # No route loaded — behave as "off-route" so the caller uses OSRM.
         new_state["off_route_hits"] = 0
         return f_lat, f_lon, True, new_state
 
-    result = snap_to_route(f_lat, f_lon, index, s_last, max_back_m, max_fwd_m)
+    result = snap_to_route(f_lat, f_lon, index, s_last, max_back_m, max_fwd_m, heading)
     if result is None:
         new_state["off_route_hits"] = 0
         return f_lat, f_lon, True, new_state
 
     snap_lat, snap_lon, s_new, perp_m = result
+
+    # Wrong-arm check: the matched segment points against the bus's travel
+    # heading (acquired on the opposite arm of an out-and-back road, where both
+    # arms overlap so the corridor test never trips). Two such fixes in a row
+    # → re-acquire globally by heading, even if that moves s backwards.
+    if heading is not None and s_last is not None and perp_m <= corridor_m:
+        seg_brg = _bearing_at_s(index, s_new)
+        if seg_brg is not None and _angle_diff(heading, seg_brg) > 120.0:
+            wrong = state.get("wrong_dir_hits", 0) + 1
+            new_state["wrong_dir_hits"] = wrong
+            if wrong >= 2:
+                g = snap_to_route(f_lat, f_lon, index, None, max_back_m, max_fwd_m, heading)
+                if g is not None and g[3] <= corridor_m and \
+                        _angle_diff(heading, _bearing_at_s(index, g[2]) or heading) <= 90.0:
+                    new_state.update({"s": g[2], "off_route_hits": 0, "wrong_dir_hits": 0})
+                    new_state.pop("reacq_s", None)
+                    pt = _point_at_s(index, g[2])
+                    out_lat, out_lon = pt if pt is not None else (g[0], g[1])
+                    return out_lat, out_lon, False, new_state
+        else:
+            new_state["wrong_dir_hits"] = 0
 
     if perp_m > corridor_m and s_last is not None:
         # The forward window found nothing close, but the fix may still be ON the
@@ -210,7 +270,7 @@ def apply_route_snap_stateless(
         # advances, and the device stays off-route for the rest of the trip.
         # Re-acquire globally, but only once two consecutive fixes agree, so one
         # wild fix can't teleport s.
-        g = snap_to_route(f_lat, f_lon, index, None, max_back_m, max_fwd_m)
+        g = snap_to_route(f_lat, f_lon, index, None, max_back_m, max_fwd_m, heading)
         if g is not None and g[3] <= corridor_m:
             cand = state.get("reacq_s")
             if cand is not None and cand - max_back_m <= g[2] <= cand + max_fwd_m:
@@ -240,8 +300,12 @@ def apply_route_snap_stateless(
 
     # On-route: reset hysteresis, smooth and advance s (never backward).
     hits = 0
+    slow = speed_kmh is not None and speed_kmh < stationary_kmh
     if s_last is None:
         s_smoothed = s_new
+    elif slow and s_new - s_last < deadband_m:
+        # Stopped: hold. Drift of a few metres must not creep the marker forward.
+        s_smoothed = s_last
     else:
         s_smoothed = s_ema_alpha * s_new + (1 - s_ema_alpha) * s_last
         s_smoothed = max(s_smoothed, s_last)  # monotonic non-decreasing on-route
@@ -252,6 +316,28 @@ def apply_route_snap_stateless(
     new_state["off_route_hits"] = 0
     new_state.pop("reacq_s", None)
     return out_lat, out_lon, False, new_state
+
+
+def _bearing_at_s(index: Dict[str, Any], s: float) -> Optional[float]:
+    """Bearing of the route segment containing progress ``s``."""
+    pts = index.get("pts") or []
+    cum = index.get("cum") or []
+    if len(pts) < 2:
+        return None
+    s = max(0.0, min(s, cum[-1]))
+    lo, hi = 0, len(cum) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cum[mid] < s:
+            lo = mid + 1
+        else:
+            hi = mid
+    i = max(1, lo)
+    # Skip zero-length segments so the bearing is meaningful.
+    while i < len(pts) - 1 and cum[i] - cum[i - 1] < 1e-6:
+        i += 1
+    a, b = pts[i - 1], pts[i]
+    return _bearing_deg(a[0], a[1], b[0], b[1])
 
 
 def _point_at_s(index: Dict[str, Any], s: float) -> Optional[Tuple[float, float]]:

@@ -145,7 +145,10 @@ async def _get_active_trip_id(redis) -> int | None:
             result = await db.execute(
                 select(Trip.id).where(
                     Trip.date == today,
-                    Trip.direction == direction,
+                    Trip.direction.in_(
+                        ["forward", "morning", "Morning", "m"] if direction == "forward"
+                        else ["reverse", "evening", "Evening", "e"]
+                    ),
                     Trip.status.in_(["scheduled", "on_trip", "active", "late"]),
                 ).order_by(Trip.id.asc()).limit(1)
             )
@@ -445,6 +448,8 @@ async def live_gps_polling_loop():
                     cluster_state = await cluster_mgr.load()
                     c_lat, c_lon, should_broadcast, new_cluster_state = apply_live_cluster_stateless(s_lat, s_lon, cluster_state)
                     await cluster_mgr.save(new_cluster_state)
+                    if not off_route:
+                        c_lat, c_lon = s_lat, s_lon
 
                 processed[log.id] = (c_lat, c_lon)
 
@@ -619,6 +624,10 @@ async def live_gps_realtime_bridge_loop():
                         s_lat, s_lon, cluster_state
                     )
                     await cluster_mgr.save(new_cluster_state)
+                    if not off_route:
+                        # On-route: the snapped point already sits on the road and is
+                        # deadbanded; the cluster centroid would pull it off the line.
+                        c_lat, c_lon = s_lat, s_lon
 
                 # Step 4: Persist into gps_logs with trip tagging
                 ist_time = server_now.astimezone(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
@@ -906,6 +915,8 @@ async def process_payload(raw: str, db: AsyncSession, server_now: datetime) -> d
         cluster_state = await cluster_mgr.load()
         c_lat, c_lon, should_broadcast, new_cluster_state = apply_live_cluster_stateless(s_lat, s_lon, cluster_state)
         await cluster_mgr.save(new_cluster_state)
+        if not off_route:
+            c_lat, c_lon = s_lat, s_lon
 
     now_ist = server_now.astimezone(ZoneInfo("Asia/Kolkata")).replace(tzinfo=None)
 

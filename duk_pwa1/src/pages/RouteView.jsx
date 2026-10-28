@@ -158,11 +158,11 @@ export default function RouteView() {
     let baseIdx = highestVisitedIdx + 1;
     if (baseIdx >= stopsToShow.length) baseIdx = stopsToShow.length;
     
-    // Widen the search window: 2 stops behind and 5 ahead.
-    // The narrower [-1,+3] window missed the bus's actual stop whenever
-    // the backend visitedStops lagged by one poll cycle (15–30 s).
+    // Search from 2 stops behind the last visited one to the END of the list.
+    // A fixed "+5" window froze the current stop (e.g. on IIITMK while the bus
+    // was in the city) whenever visitedStops lagged or came back empty.
     const startSearchIdx = Math.max(0, baseIdx - 2);
-    const endSearchIdx = Math.min(stopsToShow.length, baseIdx + 5);
+    const endSearchIdx = stopsToShow.length;
 
     for (let i = startSearchIdx; i < endSearchIdx; i++) {
       const s = stopsToShow[i];
@@ -176,19 +176,29 @@ export default function RouteView() {
     return idx;
   }, [activeBusCoord, stopsToShow, visitedStops]);
 
+  // Highest "next stop" index reached this trip. Progress along a route only
+  // moves forward, so a GPS wobble near an earlier stop can't pull it back.
+  const maxNextIdxRef = useRef({ tripId: null, idx: -1 });
   const currentNextIdx = React.useMemo(() => {
     let highestVisitedIdx = -1;
     for (let i = 0; i < stopsToShow.length; i++) {
       if (visitedStops[stopsToShow[i].name]) highestVisitedIdx = i;
     }
     let idx = highestVisitedIdx + 1;
-    
+
     // Catch-up: If the bus is physically at or past a stop, advance the index
     if (closestStopIdx !== -1 && closestStopIdx > idx) {
       idx = closestStopIdx;
     }
+    const tid = tripState?.trip_id ?? null;
+    const mem = maxNextIdxRef.current;
+    if (mem.tripId !== tid) { mem.tripId = tid; mem.idx = -1; }
+    if (isActive && tid != null) {
+      if (idx < mem.idx) idx = mem.idx;
+      mem.idx = idx;
+    }
     return Math.min(idx, stopsToShow.length);
-  }, [stopsToShow, visitedStops, closestStopIdx]);
+  }, [stopsToShow, visitedStops, closestStopIdx, tripState?.trip_id, isActive]);
 
   const visitedCount = Math.max(Object.keys(visitedStops).length, currentNextIdx);
   const nextStop = currentNextIdx >= 0 && currentNextIdx < stopsToShow.length ? stopsToShow[currentNextIdx] : null;
@@ -271,39 +281,13 @@ export default function RouteView() {
   };
 
   const displayHistoryCoords = React.useMemo(() => {
-    if (isIdleMode) return [];
-
-    // PRIMARY: Use the full server-side trail from trip_trace (DB).
-    // gps-ingestion writes every snapped GPS point here from trip start,
-    // so a user who opens the app mid-trip sees the complete route — not
-    // just from when they logged in. This is the fix for the "trail only
-    // shows from login" bug: the planned-route slice was winning over this
-    // and silently throwing away the real historical path.
-    if (routeHistory?.coords && routeHistory.coords.length > 0) {
-      return routeHistory.coords;
-    }
-
-    // FALLBACK: DB trail not yet fetched (first render before the HTTP poll
-    // returns, or trip_id not known yet). Show a temporary visual placeholder:
-    // the planned route sliced up to the bus's current position. It will be
-    // replaced by the real DB trail as soon as the first poll completes.
-    if (plannedCoords && plannedCoords.length > 0 && activeBusCoord) {
-      let minD = Infinity;
-      let closestIdx = -1;
-      for (let i = 0; i < plannedCoords.length; i++) {
-        const d = haversineDistKm(activeBusCoord[0], activeBusCoord[1], plannedCoords[i][0], plannedCoords[i][1]);
-        if (d < minD) {
-          minD = d;
-          closestIdx = i;
-        }
-      }
-      if (closestIdx !== -1) {
-        return plannedCoords.slice(0, closestIdx + 1);
-      }
-    }
-
-    return [];
-  }, [routeHistory?.coords, plannedCoords, activeBusCoord, isIdleMode]);
+    if (!showHistory) return [];
+    // The full server-side trail (trip_trace, or gps_logs when trace is empty)
+    // from trip start. No planned-route placeholder: slicing the planned line
+    // to the nearest vertex drew roads the bus never drove on out-and-back
+    // sections (and returned nothing for a MultiLineString).
+    return routeHistory?.coords?.length ? routeHistory.coords : [];
+  }, [routeHistory?.coords, showHistory]);
 
   useEffect(() => {
     if (viewMode !== 'route') return;
@@ -510,14 +494,16 @@ export default function RouteView() {
                     const scheduled = (direction === 'forward' ? stop.morning_time : stop.evening_time) || '';
                     const actualTime = arrivalTimes[stop.name] || null;
                     const effectiveLateMins = (computedLateMins != null && computedLateMins <= -1) ? 0 : computedLateMins;
-                    let displayTime = isVisited ? actualTime || scheduled : effectiveLateMins != null ? computeEstimatedTime(scheduled, effectiveLateMins) || scheduled : scheduled;
+                    // Passed without a recorded arrival: no real time is known, so show none.
+                    let displayTime = isVisited ? (actualTime || '\u2014') : effectiveLateMins != null ? computeEstimatedTime(scheduled, effectiveLateMins) || scheduled : scheduled;
                     const isLast = idx === stopsToShow.length - 1;
                     let delayType = 'none';
                     let statusSubtext = '';
 
-                    const isSkipped = (!visitedStops[stop.name] && isPassedGeographically) || (!isVisited && isActive && stopsToShow.slice(idx + 1).some(s => visitedStops[s.name]));
-                    if (isSkipped) { statusSubtext = 'Passed / Skipped'; delayType = 'late'; }
-                    else if (isVisited) {
+                    // Driving past a stop along the route is normal transit, not a skip.
+                    // There is no telemetry that proves a skip (geofence misses happen
+                    // when a stop sits across a divided road), so we never claim one.
+                    if (isVisited) {
                       if (actualTime && scheduled) {
                         const perStopDiff = parseTimeToMinutes(actualTime) - parseTimeToMinutes(scheduled);
                         const action = idx === 0 ? 'Departed' : 'Arrived';
@@ -610,8 +596,8 @@ export default function RouteView() {
               autoCenter={autoCenter}
               onAutoCenterChange={setAutoCenter}
               headingStatus={headingStatus}
-              stops={isIdleMode ? [] : stops}
-              plannedCoords={isIdleMode ? [] : plannedCoords}
+              stops={stops}
+              plannedCoords={plannedCoords}
               routeHistoryCoords={displayHistoryCoords}
               onStopClick={(s) => setSelectedStop(s)}
               onMapLoad={(map) => { 

@@ -59,6 +59,9 @@ ETA_FALLBACK_COUNT = Counter("eta_fallback_count", "Number of times ML model fai
 MODEL_PATH     = os.environ.get("MODEL_PATH", "/app/models/eta_model.onnx")
 OSRM_BASE_URL  = os.environ.get("OSRM_URL", "http://127.0.0.1:5001")
 BUS_FACTOR     = 1.35
+N_FEATURES = 8  # distance_km, stops_ahead, hour, day_of_week, direction_reverse, elapsed_min, speed_kmh, naive_osrm_eta_mins
+DWELL_PER_STOP_MIN = float(os.environ.get("DWELL_PER_STOP_MIN", "0.5"))
+ML_MAX_ETA_MIN = float(os.environ.get("ML_MAX_ETA_MIN", "180"))  # sanity cap on model output
 IST            = ZoneInfo("Asia/Kolkata")
 IST_OFFSET     = timedelta(hours=5, minutes=30)
 
@@ -115,6 +118,16 @@ async def load_model():
     try:
         if os.path.exists(MODEL_PATH):
             new_model = ort.InferenceSession(MODEL_PATH)
+            shape = new_model.get_inputs()[0].shape
+            n_in = shape[1] if len(shape) > 1 else None
+            if isinstance(n_in, int) and n_in != N_FEATURES:
+                # A model from an older trainer: every run() would raise and fall
+                # back anyway. Refuse it loudly instead of erroring per request.
+                model = None
+                logger.error("[ETA] Model %s expects %d features, service sends %d — "
+                             "ignoring it (OSRM fallback). Retrain with ml-training-job.",
+                             MODEL_PATH, n_in, N_FEATURES)
+                return
             model = new_model
             logger.info("[ETA] Loaded ONNX ML model from %s", MODEL_PATH)
         else:
@@ -213,16 +226,21 @@ async def predict_eta(
         try:
             input_name = model.get_inputs()[0].name
             pred = model.run(None, {input_name: features})[0]
-            eta_minutes = float(pred.flatten()[0])
-            eta_minutes = max(0.5, round(eta_minutes, 1))
-            now_ist = datetime.now(timezone.utc) + IST_OFFSET
-            arr_time = now_ist + timedelta(minutes=eta_minutes)
-            ETA_PREDICTION_LATENCY.observe(time.time() - start_time)
-            return {
-                "eta_minutes": eta_minutes,
-                "arrival_time": arr_time.strftime("%-I:%M %p"),
-                "source": "onnx",
-            }
+            raw_eta = float(pred.flatten()[0])
+            if not math.isfinite(raw_eta) or raw_eta < 0 or raw_eta > ML_MAX_ETA_MIN:
+                # Garbage out (negative / NaN / hours away on a ~1 h route) —
+                # do not show it; use the OSRM road estimate below instead.
+                logger.warning("[ETA] Rejected ML output %.1f min; using OSRM", raw_eta)
+            else:
+                eta_minutes = max(0.5, round(raw_eta, 1))
+                now_ist = datetime.now(timezone.utc) + IST_OFFSET
+                arr_time = now_ist + timedelta(minutes=eta_minutes)
+                ETA_PREDICTION_LATENCY.observe(time.time() - start_time)
+                return {
+                    "eta_minutes": eta_minutes,
+                    "arrival_time": arr_time.strftime("%-I:%M %p"),
+                    "source": "onnx",
+                }
         except Exception as e:
             logger.error("[ETA] Inference failed: %s", e)
 
@@ -232,7 +250,9 @@ async def predict_eta(
     # surface that in `source` instead of emitting a fabricated fixed distance
     # as the old code did (audit E3).
     route_info = await _get_osrm_route(req.lat, req.lon, req.target_lat, req.target_lon)
-    osrm_eta_mins = (route_info["duration_s"] / 60.0) * BUS_FACTOR
+    # Road time × bus factor, plus a dwell for each intermediate stop.
+    osrm_eta_mins = (route_info["duration_s"] / 60.0) * BUS_FACTOR \
+        + DWELL_PER_STOP_MIN * max(0, req.stops_ahead - 1)
     ETA_FALLBACK_COUNT.inc()
     now_ist = datetime.now(timezone.utc) + IST_OFFSET
     arr_time = now_ist + timedelta(minutes=osrm_eta_mins)

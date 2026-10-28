@@ -59,6 +59,15 @@ from database_local import get_db, AsyncSessionLocal
 from libs.duk_common.models import Trip, BusStop, GpsLog, GpsRealtime, Route, TripTrace, RouteGeometryCache
 from sqlalchemy import text
 from collections import defaultdict
+import math
+import time
+from libs.duk_common.state.route_snap import build_route_index
+from libs.duk_common.state.route_state_redis import RedisRouteState
+from libs.duk_common.route_progress import longest_line, stop_progress, filter_ahead, smooth_arrival
+
+DEVICE_ID = os.environ.get("DEVICE_ID", "bus-1")
+ML_MAX_ETA_MIN = float(os.environ.get("ML_MAX_ETA_MIN", "180"))
+DWELL_PER_STOP_MIN = float(os.environ.get("DWELL_PER_STOP_MIN", "0.5"))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -73,7 +82,7 @@ def _effective_order(stop: dict, direction: str) -> int:
     Uses an explicit None check, not `a or b`: a legitimate order index of 0
     (the origin stop) is falsy and `or` would silently drop it, scrambling the
     stop order (audit D3)."""
-    is_forward = (direction or "forward").lower().startswith("f")
+    is_forward = normalize_direction(direction) != "reverse"
     primary = stop.get("morning_order_index") if is_forward else stop.get("evening_order_index")
     return primary if primary is not None else stop.get("order_index", 0)
 
@@ -92,6 +101,19 @@ async def _compute_and_store_route_geometry(direction: str, db: AsyncSession, re
         if existing:
             logger.info("[GEOMETRY] direction=%s is pinned — skipping auto-recompute", direction)
             return json.loads(existing)
+        # Redis lost the pinned line (TTL / restart). Restore it from Postgres —
+        # recomputing here would overwrite the hand-reviewed route with an OSRM
+        # auto-route through every stop (the detour loops on the map).
+        row = (await db.execute(
+            select(RouteGeometryCache)
+            .where(RouteGeometryCache.direction == direction)
+            .order_by(desc(RouteGeometryCache.computed_at)).limit(1)
+        )).scalar_one_or_none()
+        if row and row.coordinates:
+            payload = {"coordinates": row.coordinates, "type": "MultiLineString"}
+            await redis.set(f"cache:route_geometry:{direction}", json.dumps(payload))
+            logger.info("[GEOMETRY] direction=%s pinned route restored from DB", direction)
+            return payload
         logger.warning("[GEOMETRY] direction=%s flagged pinned but no cached geometry; computing once", direction)
 
     stops = await _get_all_stops(db)
@@ -101,7 +123,13 @@ async def _compute_and_store_route_geometry(direction: str, db: AsyncSession, re
         route_groups[s["route_id"]].append(s)
 
     multi_coords = []
+    time_key = "morning_time" if is_forward else "evening_time"
     for r_id, s_list in route_groups.items():
+        # Only stops this direction actually serves. A morning-only stop used as
+        # an evening waypoint forces OSRM into a detour loop to "visit" it.
+        serving = [s for s in s_list if s.get(time_key)]
+        if len(serving) >= 2:
+            s_list = serving
         s_list.sort(key=lambda x: _effective_order(x, direction))
         if len(s_list) >= 2:
             waypoints = [(s["lat"], s["lon"]) for s in s_list]
@@ -371,11 +399,32 @@ async def get_stops_ahead(lat: float, lon: float, stops: list, direction: str, v
     return [s for s in route_stops if s["id"] not in visited_set]
 
 
+_DIR_ALIASES = {
+    "forward": ["forward", "morning", "Morning", "m"],
+    "reverse": ["reverse", "evening", "Evening", "e"],
+}
+
+
 async def get_active_trip(db: AsyncSession, now_ist: datetime, all_stops: list = None) -> Optional[Trip]:
+    """Today's trip for ETA/visited lookups.
+
+    Same resolution as trip_state and gps-ingestion: a trip that is actually
+    running (on_trip / admin-started "active" / late) wins regardless of the
+    clock. The old query skipped "active" and matched direction strings
+    exactly, so it often returned None and the ETAs ran with no visited stops,
+    no route and elapsed=0.
+    """
+    today = now_ist.date()
+    running = (await db.execute(
+        select(Trip).where(Trip.date == today, Trip.status.in_(["on_trip", "active", "late"]))
+        .order_by(desc(Trip.id)).limit(1)
+    )).scalar_one_or_none()
+    if running:
+        return running
+
     if all_stops is None:
         all_stops = await _get_all_stops(db)
     sched = get_dynamic_schedule(all_stops)
-    today = now_ist.date()
     time_mins = now_ist.hour * 60 + now_ist.minute
     if sched["morning_start_mins"] <= time_mins <= sched["morning_end_mins"]:
         direction = "forward"
@@ -387,12 +436,112 @@ async def get_active_trip(db: AsyncSession, now_ist: datetime, all_stops: list =
         select(Trip).where(
             and_(
                 Trip.date == today,
-                Trip.direction == direction,
-                Trip.status.in_(["scheduled", "on_trip", "late"]),
+                Trip.direction.in_(_DIR_ALIASES[direction]),
+                Trip.status == "scheduled",
             )
         ).order_by(desc(Trip.id)).limit(1)
     )
     return result.scalar_one_or_none()
+
+
+def _hhmm_to_mins(t) -> Optional[int]:
+    if not t:
+        return None
+    for fmt in ("%I:%M %p", "%H:%M"):
+        try:
+            d = datetime.strptime(str(t).strip().upper(), fmt)
+            return d.hour * 60 + d.minute
+        except ValueError:
+            continue
+    return None
+
+
+def _minutes_since_departure(all_stops: list, direction: str, route_id, now_ist: datetime) -> float:
+    """elapsed_minutes exactly as the trainer builds it: IST clock minus the
+    origin stop's scheduled departure (negative if early, includes delay)."""
+    is_fwd = normalize_direction(direction) == "forward"
+    key = "morning_time" if is_fwd else "evening_time"
+    route_stops = [s for s in all_stops if s.get("route_id") == route_id and s.get(key)]
+    depart = None
+    if route_stops:
+        origin = min(route_stops, key=lambda x: _effective_order(x, direction))
+        depart = _hhmm_to_mins(origin.get(key))
+    if not depart:
+        depart = 450 if is_fwd else 1060
+    return float(now_ist.hour * 60 + now_ist.minute - depart)
+
+
+_progress_cache: dict = {}
+
+
+async def _stop_positions(redis, direction: str, all_stops: list, route_id) -> dict:
+    """stop_id → metres along the planned route, cached per geometry version."""
+    db_dir = "reverse" if normalize_direction(direction) == "reverse" else "forward"
+    version = await redis.get(f"cache:route_geometry_version:{db_dir}")
+    if isinstance(version, bytes):
+        version = version.decode()
+    ordered = sorted([s for s in all_stops if s.get("route_id") == route_id],
+                     key=lambda x: _effective_order(x, direction))
+    key = (version, route_id, tuple((s["id"], s["lat"], s["lon"]) for s in ordered))
+    cached = _progress_cache.get(db_dir)
+    if cached and cached["key"] == key:
+        return cached["stop_s"]
+    raw = await redis.get(f"cache:route_geometry:{db_dir}")
+    if not raw:
+        return {}
+    index = build_route_index(longest_line(json.loads(raw).get("coordinates", [])))
+    stop_s = stop_progress(index, ordered)
+    _progress_cache[db_dir] = {"key": key, "stop_s": stop_s}
+    return stop_s
+
+
+async def _bus_progress(redis, trip: Optional[Trip]) -> Optional[float]:
+    """Bus position `s` as tracked by gps-ingestion's route snap, if it belongs
+    to this trip and the bus is on the corridor."""
+    if not trip:
+        return None
+    st = await RedisRouteState(redis, DEVICE_ID).load()
+    if st.get("key") != f"{trip.id}:{trip.direction}" or st.get("off_route_hits", 0) >= 3:
+        return None
+    return st.get("s")
+
+
+async def _drop_passed_stops(redis, trip: Optional[Trip], direction: str, all_stops: list,
+                             ahead: list, route_id) -> list:
+    """Remove stops the bus has already driven past (by route progress)."""
+    try:
+        bus_s = await _bus_progress(redis, trip)
+        if bus_s is None:
+            return ahead
+        stop_s = await _stop_positions(redis, direction, all_stops, route_id)
+        return filter_ahead(ahead, stop_s, bus_s)
+    except Exception as e:
+        logger.debug("[TRACKING] progress filter skipped: %s", e)
+        return ahead
+
+
+async def _smooth_etas(redis, trip_id, etas: dict) -> dict:
+    """Smooth each stop's predicted arrival time across polls so the countdown
+    does not bounce up and down between requests."""
+    if not redis or not trip_id or not etas:
+        return etas
+    key = f"eta_smooth:{trip_id}"
+    try:
+        prev = json.loads(await redis.get(key) or "{}")
+    except Exception:
+        prev = {}
+    now = time.time()
+    out = {}
+    for sid, eta in etas.items():
+        p = prev.get(str(sid))
+        arr = smooth_arrival(p[0] if p else None, p[1] if p else None, now + float(eta) * 60.0, now)
+        out[sid] = round(max(0.5, (arr - now) / 60.0), 1)
+        prev[str(sid)] = [arr, now]
+    try:
+        await redis.set(key, json.dumps(prev), ex=3600)
+    except Exception:
+        pass
+    return out
 
 
 async def predict_eta(bus_lat, bus_lon, target_stop_lat, target_stop_lon, stops_remaining,
@@ -417,17 +566,20 @@ async def predict_eta(bus_lat, bus_lon, target_stop_lat, target_stop_lon, stops_
         )
         if resp.status_code == 200:
             data = resp.json()
-            arr_time = to_ist(datetime.now(timezone.utc)) + timedelta(minutes=data.get("eta_minutes", 0))
-            return {
-                "eta_minutes": data.get("eta_minutes", 0),
-                "arrival_time": arr_time.strftime("%-I:%M %p"),
-                "source": "ml",
-            }
+            eta = data.get("eta_minutes")
+            if isinstance(eta, (int, float)) and math.isfinite(eta) and 0 <= eta <= ML_MAX_ETA_MIN:
+                arr_time = to_ist(datetime.now(timezone.utc)) + timedelta(minutes=eta)
+                return {
+                    "eta_minutes": eta,
+                    "arrival_time": arr_time.strftime("%-I:%M %p"),
+                    "source": data.get("source", "ml"),
+                }
+            logger.warning("[TRACKING] Rejected ML ETA %r; using OSRM", eta)
     except (Exception, asyncio.TimeoutError) as e:
         logger.debug("[TRACKING] ML ETA error: %s", e)
 
     dur_s = await get_osrm_duration_s(bus_lat, bus_lon, target_stop_lat, target_stop_lon)
-    eta_min = (dur_s / 60.0) * BUS_FACTOR
+    eta_min = (dur_s / 60.0) * BUS_FACTOR + DWELL_PER_STOP_MIN * max(0, (stops_remaining or 0) - 1)
     arr_time = to_ist(datetime.now(timezone.utc)) + timedelta(minutes=eta_min)
     return {
         "eta_minutes": round(eta_min, 1),
@@ -623,6 +775,7 @@ async def trip_state(db: AsyncSession = Depends(get_db), _user: str = Depends(re
                 
             return {
                 "trip": display_trip, "status": target_status, "trip_id": active.id,
+                "direction": normalize_direction(active.direction),
                 "late_by_minutes": late_val, "cancellation_reason": None,
                 "next_trip_time": None, "is_deviated": is_deviated,
                 "last_updated_time": last_updated_time}
@@ -688,6 +841,7 @@ async def trip_state(db: AsyncSession = Depends(get_db), _user: str = Depends(re
                     status = "active"
                 return {
                     "trip": display_trip, "status": status, "trip_id": target_trip.id,
+                    "direction": normalize_direction(target_trip.direction),
                     "late_by_minutes": None,
                     "cancellation_reason": None, "next_trip_time": None, "is_deviated": is_deviated,
                 "last_updated_time": last_updated_time}
@@ -705,7 +859,7 @@ async def trip_state(db: AsyncSession = Depends(get_db), _user: str = Depends(re
 
                 return {
                     "trip": "Not in Service", "status": "waiting" if is_waiting_window else "offline",
-                    "trip_id": target_trip.id, "late_by_minutes": None, "cancellation_reason": None,
+                    "trip_id": target_trip.id, "direction": normalize_direction(target_trip.direction), "late_by_minutes": None, "cancellation_reason": None,
                     "next_trip_time": "07:30 AM" if is_morning else "05:40 PM",
                 "last_updated_time": last_updated_time}
 
@@ -756,31 +910,64 @@ async def route_history(trip_id: int = None, db: AsyncSession = Depends(get_db),
     )
     traces = result.scalars().all()
 
+    trip = (await db.execute(select(Trip).where(Trip.id == trip_id))).scalar_one_or_none()
     stops_dicts = await _get_all_stops(db)
+    # Match only stops of this trip's route that serve its direction — matching
+    # against every stop let another route's stop "win" a nearby point.
+    route_stops = stops_dicts
+    if trip:
+        tk = "morning_time" if normalize_direction(trip.direction) == "forward" else "evening_time"
+        route_stops = [s for s in stops_dicts if s.get("route_id") == trip.route_id and s.get(tk)] or \
+                      [s for s in stops_dicts if s.get("route_id") == trip.route_id] or stops_dicts
+
     visited_stops: dict = {}
     arrival_times: dict = {}
     coords: list = []
 
+    def _mark(lat, lon, ts):
+        nearest = find_nearest_stop_math(lat, lon, route_stops, threshold_km=0.3)
+        if nearest and nearest["name"] not in arrival_times:
+            visited_stops[nearest["name"]] = True
+            if ts and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts:
+                arrival_times[nearest["name"]] = ts.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%-I:%M %p")
+
     for trace in traces:
         lat = trace.snapped_lat if trace.snapped_lat is not None else trace.raw_lat
         lon = trace.snapped_lon if trace.snapped_lon is not None else trace.raw_lon
-        
+
         if getattr(trace, "osrm_path", None):
             coords.extend(trace.osrm_path)
         elif lat is not None and lon is not None:
             coords.append([float(lon), float(lat)])
-            
-        nearest = find_nearest_stop_math(lat, lon, stops_dicts, threshold_km=0.3)
-        if nearest:
-            name = nearest["name"]
-            if name not in arrival_times:
+        if lat is not None and lon is not None:
+            _mark(lat, lon, trace.gps_time)
+
+    if not traces:
+        # trip_trace empty (rows never written / cleaned up) — every GPS row is
+        # also tagged with trip_id in gps_logs, so rebuild the trail from there
+        # instead of showing nothing (the "trail only from when I opened the app").
+        logs = (await db.execute(
+            select(GpsLog.lat, GpsLog.lon, GpsLog.server_time)
+            .where(GpsLog.trip_id == trip_id, GpsLog.lat.isnot(None), GpsLog.lon.isnot(None))
+            .order_by(GpsLog.server_time)
+        )).all()
+        last = None
+        for lg in logs:
+            pt = [float(lg.lon), float(lg.lat)]
+            if last is None or haversine_km(last[1], last[0], pt[1], pt[0]) >= 0.01:
+                coords.append(pt)
+                last = pt
+            _mark(lg.lat, lg.lon, lg.server_time)
+
+    # trip-lifecycle's visited list (OSRM geofence) is a second source of truth.
+    if trip and trip.visited_stops:
+        by_id = {s["id"]: s["name"] for s in stops_dicts}
+        for sid in trip.visited_stops:
+            name = by_id.get(sid)
+            if name:
                 visited_stops[name] = True
-                ts = trace.gps_time
-                if ts and ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-                if ts:
-                    ts_ist = ts.astimezone(ZoneInfo("Asia/Kolkata"))
-                    arrival_times[name] = ts_ist.strftime("%-I:%M %p")
 
     payload = {"visitedStops": visited_stops, "arrivalTimes": arrival_times, "coords": coords}
     # Cache for 30 seconds — trail updates every ~7s so this is a good balance
@@ -987,11 +1174,14 @@ async def get_eta(stop_id: int = Query(...), db: AsyncSession = Depends(get_db),
     if not visited:
         visited = await get_dynamic_visited_stops(db, redis, direction, all_stops)
 
-    ahead = await get_stops_ahead(latest.lat, latest.lon, all_stops, direction, visited,
-                                   active_trip.route_id if active_trip else stop.route_id)
+    eta_route_id = active_trip.route_id if active_trip else stop.route_id
+    ahead = await get_stops_ahead(latest.lat, latest.lon, all_stops, direction, visited, eta_route_id)
+    before = {s["id"] for s in ahead}
+    ahead = await _drop_passed_stops(redis, active_trip, direction, all_stops, ahead, eta_route_id)
+    driven_past = before - {s["id"] for s in ahead}
 
     target_in_ahead = next((s for s in ahead if s["id"] == stop_id), None)
-    if not target_in_ahead and stop_id in visited:
+    if not target_in_ahead and (stop_id in visited or stop_id in driven_past):
         response = {"stop_id": stop_id, "stop_name": stop.name, "status": "passed"}
         await redis.setex(eta_cache_key, 60, json.dumps(response))
         return response
@@ -1001,23 +1191,19 @@ async def get_eta(stop_id: int = Query(...), db: AsyncSession = Depends(get_db),
         await redis.setex(eta_cache_key, 60, json.dumps(response))
         return response
 
+    stop_route_id = stop.route_id
     is_forward = normalize_direction(direction) == "forward"
     target_eff = _effective_order(
         {"morning_order_index": stop.morning_order_index,
          "evening_order_index": stop.evening_order_index,
          "order_index": stop.order_index}, direction)
-    if is_forward:
-        stops_remaining = len([s for s in ahead if _effective_order(s, direction) <= target_eff])
-    else:
-        stops_remaining = len([s for s in ahead if _effective_order(s, direction) >= target_eff])
+    # Direction-aware order ascends in travel order for both directions.
+    stops_remaining = len([s for s in ahead if _effective_order(s, direction) <= target_eff])
     snapped_bus_lat, snapped_bus_lon = await snap_to_road(latest.lat, latest.lon)
 
-    elapsed_minutes = 0.0
-    if active_trip and active_trip.started_at:
-        trip_started = active_trip.started_at
-        if trip_started.tzinfo is None:
-            trip_started = trip_started.replace(tzinfo=timezone.utc)
-        elapsed_minutes = max(0.0, (now - trip_started).total_seconds() / 60.0)
+    # Same definition the model was trained on (see _minutes_since_departure).
+    elapsed_minutes = _minutes_since_departure(
+        all_stops, direction, active_trip.route_id if active_trip else stop_route_id, now_ist)
 
     prediction = await predict_eta(
         bus_lat=snapped_bus_lat, bus_lon=snapped_bus_lon, target_stop_lat=stop.lat, target_stop_lon=stop.lon,
@@ -1026,6 +1212,9 @@ async def get_eta(stop_id: int = Query(...), db: AsyncSession = Depends(get_db),
         # direction feature matches reality even for early/late trips.
         trip_direction=1 if normalize_direction(direction) == "reverse" else 0, elapsed_minutes=elapsed_minutes, speed_last_3=speed_avg,
     )
+    if active_trip and prediction.get("eta_minutes") is not None:
+        sm = await _smooth_etas(redis, active_trip.id, {stop_id: prediction["eta_minutes"]})
+        prediction["eta_minutes"] = sm[stop_id]
     response = {"stop_id": stop_id, "stop_name": stop.name, "bus_lat": snapped_bus_lat, "bus_lon": snapped_bus_lon, **prediction}
     await redis.setex(eta_cache_key, 60, json.dumps(response))
     return response
@@ -1056,8 +1245,9 @@ async def get_all_etas(db: AsyncSession = Depends(get_db), _user: str = Depends(
     all_stops = await _get_all_stops(db)
     active_trip = await get_active_trip(db, now_ist, all_stops)
     direction = active_trip.direction if active_trip else ("reverse" if (now_ist.hour * 60 + now_ist.minute >= 1050) else "forward")
-    visited = active_trip.visited_stops if active_trip else []
+    visited = (active_trip.visited_stops if active_trip else None) or []
     trip_id = active_trip.id if active_trip else 0
+    stop_route_id = active_trip.route_id if active_trip else 1
 
     # Build cache key from position bucket (~111 m resolution) + trip + direction
     blat = round(latest.lat, 3)
@@ -1073,25 +1263,19 @@ async def get_all_etas(db: AsyncSession = Depends(get_db), _user: str = Depends(
     except Exception:
         redis = None
 
-    ahead = await get_stops_ahead(latest.lat, latest.lon, all_stops, direction, visited,
-                                   active_trip.route_id if active_trip else 1)
+    ahead = await get_stops_ahead(latest.lat, latest.lon, all_stops, direction, visited, stop_route_id)
+    ahead = await _drop_passed_stops(redis, active_trip, direction, all_stops, ahead, stop_route_id)
     snapped_bus_lat, snapped_bus_lon = await snap_to_road(latest.lat, latest.lon)
 
-    elapsed_minutes = 0.0
-    if active_trip and active_trip.started_at:
-        trip_started = active_trip.started_at
-        if trip_started.tzinfo is None:
-            trip_started = trip_started.replace(tzinfo=timezone.utc)
-        elapsed_minutes = max(0.0, (now - trip_started).total_seconds() / 60.0)
+    # Same definition the model was trained on (see _minutes_since_departure).
+    elapsed_minutes = _minutes_since_departure(
+        all_stops, direction, active_trip.route_id if active_trip else stop_route_id, now_ist)
 
     tasks = []
     for stop in ahead:
         is_forward = normalize_direction(direction) == "forward"
         target_eff = _effective_order(stop, direction)
-        if is_forward:
-            stops_remaining = len([s for s in ahead if _effective_order(s, direction) <= target_eff])
-        else:
-            stops_remaining = len([s for s in ahead if _effective_order(s, direction) >= target_eff])
+        stops_remaining = len([s for s in ahead if _effective_order(s, direction) <= target_eff])
         tasks.append(predict_eta(
             bus_lat=snapped_bus_lat, bus_lon=snapped_bus_lon, target_stop_lat=stop["lat"], target_stop_lon=stop["lon"],
             stops_remaining=stops_remaining, hour_of_day=now_ist.hour, day_of_week=now_ist.weekday(),
@@ -1102,14 +1286,22 @@ async def get_all_etas(db: AsyncSession = Depends(get_db), _user: str = Depends(
 
     predictions = await asyncio.gather(*tasks, return_exceptions=True)
 
-    etas = {}
-    last_eta = -1.0
+    raw = {}
     for idx, stop in enumerate(ahead):
         pred = predictions[idx]
         if not isinstance(pred, Exception):
-            # Enforce monotonic ETAs (each stop must take at least 1 min longer than previous)
-            current_eta = max(float(pred["eta_minutes"]), last_eta + 1.0)
-            etas[stop["id"]] = current_eta
+            raw[stop["id"]] = float(pred["eta_minutes"])
+    raw = await _smooth_etas(redis, trip_id, raw)
+
+    # Along the route, later stops can't be reached sooner. `ahead` now holds
+    # only stops still in front of the bus, so this clamp no longer drags a
+    # passed stop's big ETA onto every later stop.
+    etas = {}
+    last_eta = -1.0
+    for stop in ahead:
+        if stop["id"] in raw:
+            current_eta = max(raw[stop["id"]], last_eta + 0.5)
+            etas[stop["id"]] = round(current_eta, 1)
             last_eta = current_eta
 
     # Write back to Redis

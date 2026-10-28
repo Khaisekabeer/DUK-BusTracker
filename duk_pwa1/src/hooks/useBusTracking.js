@@ -43,6 +43,14 @@ export default function useBusTracking() {
   const isFetchingRef = useRef(false);
   const isLiveRef = useRef(false); // tracks WS liveness without triggering re-renders
   const stopsRef = useRef([]);
+  // Last successful trip / history. A single failed poll must not blank them:
+  // tripState=null flipped the UI to "offline" and cleared the trail.
+  const lastTripRef = useRef(state.tripState || null);
+  const lastHistoryRef = useRef(state.history || null);
+  // Planned route last pushed to state/the map. setInterval keeps the
+  // mount-time fetchAll, whose `state` never changes — comparing against it
+  // re-dispatched the route every poll and reset the map's route snapping.
+  const plannedSentRef = useRef(null);
 
   // Core API Polling
   const fetchAll = async () => {
@@ -51,9 +59,13 @@ export default function useBusTracking() {
 
     try {
       let trip = null;
+      let tripOk = false;
       try {
         trip = await getTripState();
+        tripOk = true;
       } catch (_) { }
+      if (!tripOk) trip = lastTripRef.current;
+      else lastTripRef.current = trip;
 
       const [busRes, histRes, stopsRes] = await Promise.allSettled([
         getLatestGps(),
@@ -62,11 +74,15 @@ export default function useBusTracking() {
       ]);
 
       const bus = busRes.status === 'fulfilled' ? busRes.value : null;
-      const history = histRes.status === 'fulfilled' ? histRes.value : null;
+      const historyOk = histRes.status === 'fulfilled' && histRes.value;
+      // Keep the previous history for the same trip when this fetch failed.
+      const history = historyOk ? histRes.value
+        : (lastHistoryRef.current && lastHistoryRef.current._tripId === (trip?.trip_id || null) ? lastHistoryRef.current : null);
+      if (historyOk) { history._tripId = trip?.trip_id || null; lastHistoryRef.current = history; }
       const fetchedStops = stopsRes.status === 'fulfilled' ? stopsRes.value : [];
 
       const updates = {};
-      updates.tripState = trip;
+      if (tripOk) updates.tripState = trip;
 
       if (bus?.is_live) {
         updates.busPosition = bus;
@@ -152,26 +168,27 @@ export default function useBusTracking() {
         updates.mlEtas = null;
       }
 
-      // Route Geometry — fetch once per trip, cache at module level.
+      // Route Geometry — fetched once per trip (or per direction when no trip
+      // is running, so the planned line still shows while waiting / idle).
       const currentTripId = trip?.trip_id;
-      if (currentTripId) {
-        if (!_cachedRouteGeometry[currentTripId]) {
-          try {
-            const geo = await getRouteGeometry(currentTripId, trip.direction);
-            if (geo?.coordinates?.length) {
-              _cachedRouteGeometry[currentTripId] = geo.coordinates;
-              updates.plannedCoords = geo.coordinates;
-              // Notify BusMapView's TrailManager so it can snap-to-route instantly
-              window.dispatchEvent(new CustomEvent('planned-route-ready', { detail: geo.coordinates }));
-            }
-          } catch (_) { }
-        } else if (state.plannedCoords !== _cachedRouteGeometry[currentTripId]) {
-          updates.plannedCoords = _cachedRouteGeometry[currentTripId];
-          // Re-emit in case BusMapView remounted and lost the previous event
-          window.dispatchEvent(new CustomEvent('planned-route-ready', { detail: _cachedRouteGeometry[currentTripId] }));
-        }
-      } else {
-        updates.plannedCoords = [];
+      const geoDir = (trip?.direction === 'forward' || trip?.direction === 'reverse')
+        ? trip.direction
+        : (trip?.trip || '').toLowerCase().includes('morning') ? 'forward'
+        : (trip?.trip || '').toLowerCase().includes('evening') ? 'reverse'
+        : new Date().getHours() >= 14 ? 'reverse' : 'forward';
+      const geoKey = currentTripId ? `trip:${currentTripId}` : `dir:${geoDir}`;
+      if (!_cachedRouteGeometry[geoKey]) {
+        try {
+          const geo = await getRouteGeometry(currentTripId || null, geoDir);
+          if (geo?.coordinates?.length) _cachedRouteGeometry[geoKey] = geo.coordinates;
+        } catch (_) { }
+      }
+      const planned = _cachedRouteGeometry[geoKey];
+      if (planned && plannedSentRef.current !== planned) {
+        plannedSentRef.current = planned;
+        updates.plannedCoords = planned;
+        // Notify BusMapView's TrailManager so it can snap-to-route instantly
+        window.dispatchEvent(new CustomEvent('planned-route-ready', { detail: planned }));
       }
 
       dispatch({ type: 'BATCH_UPDATE', payload: updates });
@@ -183,12 +200,16 @@ export default function useBusTracking() {
     }
   };
 
+  // Always call the latest fetchAll from timers/listeners (no stale closure).
+  const fetchAllRef = useRef(fetchAll);
+  fetchAllRef.current = fetchAll;
+
   // Reschedule the polling interval based on current liveness.
   // When the bus is live, WebSocket handles GPS — we poll less aggressively.
   const _rescheduleInterval = (live) => {
     if (intervalRef.current) clearInterval(intervalRef.current);
     const ms = live ? LIGHT_POLL_MS : HEAVY_POLL_MS;
-    intervalRef.current = setInterval(fetchAll, ms);
+    intervalRef.current = setInterval(() => fetchAllRef.current(), ms);
   };
 
   // Setup Polling and WebSockets
@@ -198,6 +219,11 @@ export default function useBusTracking() {
 
     let isMounted = true;
     let reconnectTimeout = null;
+
+    // The map teleported the marker after a gap — refill the trail from the
+    // server history now rather than at the next poll.
+    const onResync = () => fetchAllRef.current();
+    window.addEventListener('trail-resync', onResync);
 
     const connectWs = () => {
       // Carry the JWT in the Sec-WebSocket-Protocol subprotocol (["bearer","<jwt>"])
@@ -328,6 +354,7 @@ export default function useBusTracking() {
 
     return () => {
       isMounted = false;
+      window.removeEventListener('trail-resync', onResync);
       clearInterval(intervalRef.current);
       if (wsRef.current) wsRef.current.close();
       if (reconnectTimeout) clearTimeout(reconnectTimeout);

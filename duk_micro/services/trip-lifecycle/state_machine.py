@@ -48,6 +48,8 @@ DESTINATION_RADIUS_M = 300
 GRACE_PERIOD_S       = 1200   # 20 minutes grace before auto-completing after power-off
 MOVEMENT_THRESHOLD_M = 50     # Min movement from route start to detect trip has begun
 STOP_ALERT_RADIUS_M  = 250    # OSRM distance to mark stop as reached
+STOP_NEAR_RADIUS_M   = 80     # straight-line distance that also counts as reached
+RUNNING_TRIP_GRACE_MINS = 120 # a running trip may run this long past its start window
 
 # In-process grace timers (one per trip_id).
 COMPLETION_TIMERS: dict = {}
@@ -153,7 +155,10 @@ async def get_active_trip(db: AsyncSession, now_ist: datetime, bus_id: int) -> O
         .where(
             and_(
                 Trip.date      == today,
-                Trip.direction == direction,
+                Trip.direction.in_(
+                    ["forward", "morning", "Morning", "m"] if direction == "forward"
+                    else ["reverse", "evening", "Evening", "e"]
+                ),
                 Trip.status.in_(["scheduled", "on_trip", "active", "late"]),
                 # Trips created by the admin dashboard (ensure/create/cancel)
                 # don't set bus_id, so a strict equality never matched and the
@@ -352,7 +357,7 @@ async def check_eta_late_notification(
     eta_min      = (duration_s / 60.0) * BUS_FACTOR
     now_ist      = datetime.now(timezone.utc).astimezone(IST)
     time_mins    = now_ist.hour * 60 + now_ist.minute
-    sched_end    = MORNING_END_MINS if trip.direction == "forward" else EVENING_END_MINS
+    sched_end    = MORNING_END_MINS if normalize_direction(trip.direction) == "forward" else EVENING_END_MINS
     expected_end = sched_end - 30  # expected arrival is 30 min before window close
     eta_arrival  = time_mins + eta_min
     delay_min    = eta_arrival - expected_end
@@ -425,8 +430,11 @@ async def update_visited_stops(db: AsyncSession, bus: EventBus, trip: Trip, lat:
     dests     = [(s["lat"], s["lon"]) for s in candidates]
     distances = await get_osrm_distance_matrix_m(lat, lon, dests)
 
-    is_fwd = (trip.direction == "forward")
-    reached = [s for s, d in zip(candidates, distances) if d <= STOP_ALERT_RADIUS_M]
+    is_fwd = (normalize_direction(trip.direction) == "forward")
+    # OSRM road distance alone misses stops across a divided road (driving
+    # there needs a U-turn → km). Being physically beside the stop counts too.
+    reached = [s for s, d in zip(candidates, distances)
+               if d <= STOP_ALERT_RADIUS_M or haversine_m(lat, lon, s["lat"], s["lon"]) <= STOP_NEAR_RADIUS_M]
     if not reached:
         return
 
@@ -442,9 +450,11 @@ async def update_visited_stops(db: AsyncSession, bus: EventBus, trip: Trip, lat:
     for s in route_stops:
         if s["id"] in visited_set or s["id"] in new_ids:
             continue
-        if is_fwd and key_fn(s) < key_fn(furthest):
-            new_ids.append(s["id"])
-        elif not is_fwd and key_fn(s) > key_fn(furthest):
+        # key_fn is already direction-aware and both order indexes ascend in
+        # travel order (get_start_stop = min, get_destination_stop = max), so
+        # "before the furthest stop" is `<` for both directions. The old `>`
+        # for reverse marked every *later* evening stop visited at once.
+        if key_fn(s) < key_fn(furthest):
             new_ids.append(s["id"])
 
     trip.visited_stops = visited + new_ids
@@ -493,13 +503,22 @@ async def auto_complete_expired_trips(db: AsyncSession) -> bool:
             expired = True
         elif t.date and t.date == today_ist:
             is_morning = normalize_direction(t.direction) == "forward"
-            if is_morning and time_mins > MORNING_END_MINS:
-                expired = True
-            elif not is_morning and time_mins > EVENING_END_MINS:
+            end_mins = MORNING_END_MINS if is_morning else EVENING_END_MINS
+            # The window end is the latest *start* time. A trip already running
+            # (late bus still on the road) must not be killed at that moment —
+            # doing so dropped its trip_id mid-route (trail, visited stops and
+            # ETAs vanished). Running trips get a failsafe grace instead; they
+            # normally complete at the destination geofence.
+            if t.status != "scheduled":
+                end_mins += RUNNING_TRIP_GRACE_MINS
+            if time_mins > end_mins:
                 expired = True
 
         if expired:
             t.status   = "completed"
+            if t.ended_at is None:
+                # trip_trace cleanup keys off ended_at; without it rows never expire.
+                t.ended_at = datetime.now(timezone.utc)
             modified   = True
             await _cancel_grace_timer(t.id)
             logger.info("[LIFECYCLE] Trip #%d expired (%s %s) -> completed", t.id, t.date, t.direction)
@@ -587,7 +606,7 @@ async def process_gps_event(event_data: dict, db: AsyncSession, redis: Redis, bu
 
     #  scheduled -> on_trip 
     if trip.status == "scheduled":
-        if trip.direction == "reverse" and now_ist.hour < 17:
+        if normalize_direction(trip.direction) == "reverse" and now_ist.hour < 17:
             return
         try:
             start_stop = await get_start_stop(db, trip.direction, trip.route_id)
@@ -650,7 +669,7 @@ async def process_gps_event(event_data: dict, db: AsyncSession, redis: Redis, bu
         logger.debug("[LIFECYCLE] Trip #%d %.0fm from destination", trip.id, dist_to_dest)
 
         # Completion check
-        completion_radius = 100 if trip.direction == "forward" else 50
+        completion_radius = 100 if normalize_direction(trip.direction) == "forward" else 50
         if dist_to_dest <= completion_radius:
             # Guarded transition so concurrent workers can't both emit "completed".
             result = await db.execute(

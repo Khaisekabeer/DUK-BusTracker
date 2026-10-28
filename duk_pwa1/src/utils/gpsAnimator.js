@@ -8,9 +8,15 @@ class GPSAnimator {
     
     this.onPositionUpdate = options.onPositionUpdate; // Callback to set marker pos
     this.onSegmentFinished = options.onSegmentFinished; // Callback to commit trail
+    this.onJump = options.onJump;                       // Callback when the marker teleports (no leg)
 
     //  Tuning 
-    this.CLUSTER_RADIUS_M   = options.clusterRadiusM   ?? 5;    // treat as "same spot" below this (small so slow buses still animate)
+    this.CLUSTER_RADIUS_M   = options.clusterRadiusM   ?? 10;   // deadband: GPS drift at a stop is 3–10 m
+    this.STATIONARY_KMH     = options.stationaryKmh    ?? 2.5;  // below this the bus is treated as stopped
+    this.STOPPED_RADIUS_M   = options.stoppedRadiusM   ?? 25;   // ...and fixes this close are held
+    this.MAX_BACKLOG        = options.maxBacklog       ?? 2;    // more queued legs than this = catch-up: skip to newest
+    this.STALE_GAP_MS       = options.staleGapMs       ?? 30000; // a gap this long (sleep / reconnect) = teleport
+    this.TELEPORT_M         = options.teleportM        ?? 1500;  // so far away that animating would be a "rush"
     this.MAX_ANIM_DURATION  = options.maxAnimDuration  ?? 8000; // cap animation length (ms) 
     this.MIN_ANIM_DURATION  = options.minAnimDuration  ?? 800;  // floor, avoid instant snaps
     this.FETCH_ROAD_SEGMENT = options.fetchRoadSegment ?? true; // follow real road shape
@@ -33,22 +39,59 @@ class GPSAnimator {
    * Call this every time a new GPS point arrives from the WebSocket.
    * Does NOT move the marker immediately — just queues it.
    */
-  pushPoint(lat, lon, serverTimeIso, precomputedOsrmPath) {
+  pushPoint(lat, lon, serverTimeIso, precomputedOsrmPath, speedKmh = null) {
     const timestamp = serverTimeIso ? new Date(serverTimeIso).getTime() : Date.now();
 
     // First point ever — place marker directly, nothing to animate from
     if (this.currentPos === null) {
-      this.currentPos = { lat, lon };
-      this.onPositionUpdate([lon, lat]);
-      this.lastPointTime = timestamp;
+      this._jumpTo(lat, lon, timestamp, true);
       return;
     }
 
-    this.queue.push({ lat, lon, timestamp, precomputedOsrmPath });
+    // Long silence (phone slept, WS reconnected) or a far jump: animating from
+    // the stale spot is the "fast-forward rush". Appear at the new spot instead.
+    const gap = this.lastPointTime != null ? timestamp - this.lastPointTime : 0;
+    const far = this._haversineM(this.currentPos.lat, this.currentPos.lon, lat, lon) > this.TELEPORT_M;
+    if (gap > this.STALE_GAP_MS || far) {
+      this._jumpTo(lat, lon, timestamp);
+      return;
+    }
+
+    this.queue.push({ lat, lon, timestamp, precomputedOsrmPath, speedKmh });
+
+    // Backlog (rAF paused in background, slow segment fetch): drop the stale
+    // middle legs and go straight for the newest fix.
+    if (this.queue.length > this.MAX_BACKLOG) {
+      this.queue = [this.queue[this.queue.length - 1]];
+      this.queue[0].catchUp = true;
+    }
+    // A leg is still playing but newer fixes are waiting: finish it briskly
+    // instead of letting it run its full (up to 8 s) duration.
+    if (this._anim) {
+      const now = performance.now();
+      const elapsed = now - this._anim.startTime;
+      const remaining = this._anim.duration - elapsed;
+      if (remaining > this.MIN_ANIM_DURATION) this._anim.duration = elapsed + this.MIN_ANIM_DURATION;
+    }
 
     if (!this.animating) {
       this._processQueue();
     }
+  }
+
+  /** Cancel any animation and place the marker at a point, no trail leg. */
+  _jumpTo(lat, lon, timestamp, first = false) {
+    if (this.animFrame) cancelAnimationFrame(this.animFrame);
+    this.animFrame = null;
+    this.queue = [];
+    this._segData = null;
+    this._anim = null;
+    this.animating = false;
+    this._gen = (this._gen || 0) + 1; // invalidates an in-flight segment fetch
+    this.currentPos = { lat, lon };
+    this.lastPointTime = timestamp;
+    this.onPositionUpdate([lon, lat]);
+    if (this.onJump && !first) this.onJump([lon, lat]);
   }
 
   async _processQueue() {
@@ -63,27 +106,22 @@ class GPSAnimator {
       this.currentPos.lat, this.currentPos.lon, next.lat, next.lon
     );
 
-    //  Clustering: if the bus barely moved, don't animate — just settle
-    if (distM < this.CLUSTER_RADIUS_M) {
-      // Bus is essentially stationary. Teleporting to each jittery fix is what
-      // makes the marker "shake" at a stop, so instead of snapping we apply a
-      // gentle EMA nudge (sub-metre at this range) and hold otherwise.
-      const a = 0.15;
-      this.currentPos = {
-        lat: this.currentPos.lat + (next.lat - this.currentPos.lat) * a,
-        lon: this.currentPos.lon + (next.lon - this.currentPos.lon) * a,
-      };
-      this.onPositionUpdate([this.currentPos.lon, this.currentPos.lat]);
+    //  Deadband: bus is stopped / drifting — hold the marker completely still.
+    // (Any nudge, even an EMA one, reads as shaking at a stop.)
+    const stopped = next.speedKmh != null && next.speedKmh < this.STATIONARY_KMH;
+    if (distM < this.CLUSTER_RADIUS_M || (stopped && distM < this.STOPPED_RADIUS_M)) {
       this.lastPointTime = next.timestamp;
-      // Immediately process any further queued points (they're likely also clustered)
-      requestAnimationFrame(() => this._processQueue());
+      this._processQueue();
       return;
     }
 
     //  Compute animation duration from actual time gap between pings 
     let duration = next.timestamp - (this.lastPointTime || (next.timestamp - 5000));
     duration = Math.max(this.MIN_ANIM_DURATION, Math.min(this.MAX_ANIM_DURATION, duration));
+    // Catching up, or more points already waiting: move briskly to stay live.
+    if (next.catchUp || this.queue.length > 0) duration = this.MIN_ANIM_DURATION;
     this.lastPointTime = next.timestamp;
+    const gen = this._gen || 0;
 
     //  Optionally fetch the real road geometry for this leg 
     let path = [
@@ -106,7 +144,14 @@ class GPSAnimator {
       } catch (e) {
         // Fall back to straight line silently
       }
+      // A jump happened while we awaited the fetch — this leg is obsolete.
+      if (gen !== (this._gen || 0)) return;
     }
+
+    // Start the leg exactly at the marker and end exactly at the fix, so there
+    // is no teleport at either end (backend paths start at the last *trace*
+    // point, which is not always where the marker is).
+    path = this._anchorPath(path, this.currentPos, next);
 
     // Precompute segment data for O(log n) frame interpolation
     this._segData = this._buildSegData(path);
@@ -172,12 +217,14 @@ class GPSAnimator {
   }
 
   _animateAlongPath(path, duration, targetPoint) {
-    const startTime = performance.now();
+    // Mutable so pushPoint() can shorten a leg when newer fixes arrive.
+    const anim = { startTime: performance.now(), duration };
+    this._anim = anim;
     const segData = this._segData;
 
     const step = (now) => {
-      const elapsed = now - startTime;
-      const t = Math.min(1, elapsed / duration); // 0 → 1 progress
+      const elapsed = now - anim.startTime;
+      const t = Math.min(1, elapsed / anim.duration); // 0 → 1 progress
 
       const targetDist = t * segData.totalLength;
       const { point, segIndex } = this._interpolatePosition(targetDist);
@@ -191,6 +238,7 @@ class GPSAnimator {
       if (t < 1) {
         this.animFrame = requestAnimationFrame(step);
       } else {
+        this._anim = null;
         this.currentPos = { lat: targetPoint.lat, lon: targetPoint.lon };
         this.onPositionUpdate([targetPoint.lon, targetPoint.lat], path);
         if (this.onSegmentFinished) this.onSegmentFinished(path);
@@ -201,6 +249,30 @@ class GPSAnimator {
     };
 
     this.animFrame = requestAnimationFrame(step);
+  }
+
+  /**
+   * Trim a [[lon,lat],...] path so it begins at the vertex nearest `from` and
+   * ends at the vertex nearest `to` (searched after the start), then pin the
+   * true endpoints on. Falls back to a straight leg if the path is unusable.
+   */
+  _anchorPath(path, from, to) {
+    const straight = [[from.lon, from.lat], [to.lon, to.lat]];
+    if (!path || path.length < 2) return straight;
+    let iFrom = 0, dFrom = Infinity;
+    for (let i = 0; i < path.length; i++) {
+      const d = this._haversineM(from.lat, from.lon, path[i][1], path[i][0]);
+      if (d < dFrom) { dFrom = d; iFrom = i; }
+    }
+    let iTo = path.length - 1, dTo = Infinity;
+    for (let i = iFrom; i < path.length; i++) {
+      const d = this._haversineM(to.lat, to.lon, path[i][1], path[i][0]);
+      if (d < dTo) { dTo = d; iTo = i; }
+    }
+    // Path doesn't actually connect the two points — don't animate along it.
+    if (dFrom > 150 || dTo > 150) return straight;
+    const mid = path.slice(iFrom, iTo + 1);
+    return [[from.lon, from.lat], ...mid, [to.lon, to.lat]];
   }
 
   _haversineM(lat1, lon1, lat2, lon2) {
@@ -218,6 +290,7 @@ class GPSAnimator {
     if (this.animFrame) cancelAnimationFrame(this.animFrame);
     this.queue = [];
     this._segData = null;
+    this._gen = (this._gen || 0) + 1;
   }
 }
 

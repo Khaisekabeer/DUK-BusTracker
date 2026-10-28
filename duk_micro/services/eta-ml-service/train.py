@@ -11,7 +11,9 @@ import sys
 import math
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo as _ZoneInfo
+_IST = _ZoneInfo("Asia/Kolkata")
 from sqlalchemy import create_engine
 import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -172,8 +174,8 @@ def main():
                 # Mark furthest and all preceding as visited
                 for s in route_stops:
                     if s["id"] in visited_stops: continue
-                    if (is_fwd and _eff(s, True) <= _eff(furthest, True)) or \
-                       (not is_fwd and _eff(s, False) >= _eff(furthest, False)):
+                    # Order indexes ascend in travel order for both directions.
+                    if _eff(s, is_fwd) <= _eff(furthest, is_fwd):
                         visited_stops.add(s["id"])
                         if s["id"] not in stop_arrivals:
                             stop_arrivals[s["id"]] = ts
@@ -202,19 +204,19 @@ def main():
             lat, lon, ts = pt["lat"], pt["lon"], pt["ts"]
             speed = pt.get("speed") or 25.0
             
-            hour = ts.hour
-            day_of_week = ts.weekday()
-            elapsed_min = (hour * 60 + ts.minute) - depart_mins
+            # Features are IST (matches inference). Naive values come from ist_time.
+            ts_ist = ts.astimezone(_IST) if ts.tzinfo else ts
+            hour = ts_ist.hour
+            day_of_week = ts_ist.weekday()
+            elapsed_min = (hour * 60 + ts_ist.minute) - depart_mins
             
             # Update last visited order based on what we've reached by this timestamp
             # We already have stop_arrivals
             for s in route_stops:
                 if s["id"] not in visited_set and s["id"] in stop_arrivals and ts >= stop_arrivals[s["id"]]:
                     visited_set.add(s["id"])
-                    if is_fwd and _eff(s, True) > last_visited_order:
-                        last_visited_order = _eff(s, True)
-                    elif not is_fwd and _eff(s, False) < last_visited_order:
-                        last_visited_order = _eff(s, False)
+                    if _eff(s, is_fwd) > last_visited_order:
+                        last_visited_order = _eff(s, is_fwd)
 
             # For upcoming stops
             for s in route_stops:

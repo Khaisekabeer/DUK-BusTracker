@@ -48,15 +48,15 @@ registerRoute(
 );
 
 /**
- * Firebase config.
- * These values are public client identifiers, not private secrets.
+ * Firebase config — from build-time env (duk_pwa1/.env*, see .env.example).
+ * No hardcoded fallbacks: without the env vars push is simply disabled.
  */
 const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "",
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "dukbus-bcf10.firebaseapp.com",
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "dukbus-bcf10",
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "",
-  appId: import.meta.env.VITE_FIREBASE_APP_ID || ""
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
 if (firebaseConfig.apiKey && firebaseConfig.messagingSenderId) {

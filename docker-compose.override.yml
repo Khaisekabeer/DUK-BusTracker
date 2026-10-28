@@ -36,3 +36,7 @@ services:
       - "--entrypoints.web.address=:80"
     ports: !override
       - "8080:80"
+
+  osrm-backend:
+    # docker.io/osrm/osrm-backend:v5.27.1 does not exist; the project publishes on GHCR.
+    image: ghcr.io/project-osrm/osrm-backend:v5.27.1

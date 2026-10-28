@@ -14,6 +14,8 @@ import os
 import uuid
 import numpy as np
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo as _ZoneInfo
+_IST = _ZoneInfo("Asia/Kolkata")
 from pathlib import Path
 from redis.asyncio import Redis
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -290,8 +292,8 @@ async def run_training():
 
                 for s in route_stops:
                     if s["id"] in visited_stops: continue
-                    if (is_fwd and _eff(s) <= _eff(furthest)) or \
-                       (not is_fwd and _eff(s) >= _eff(furthest)):
+                    # Order indexes ascend in travel order for both directions.
+                    if _eff(s) <= _eff(furthest):
                         visited_stops.add(s["id"])
                         if s["id"] not in stop_arrivals:
                             stop_arrivals[s["id"]] = ts
@@ -314,16 +316,16 @@ async def run_training():
             lat, lon, ts = pt["lat"], pt["lon"], pt["ts"]
             speed = pt["speed"]
             
-            hour = ts.hour
-            day_of_week = ts.weekday()
-            elapsed_min = (hour * 60 + ts.minute) - depart_mins
+            # Timestamps are UTC; schedule and inference features are IST.
+            ts_ist = ts.astimezone(_IST) if ts.tzinfo else ts.replace(tzinfo=timezone.utc).astimezone(_IST)
+            hour = ts_ist.hour
+            day_of_week = ts_ist.weekday()
+            elapsed_min = (hour * 60 + ts_ist.minute) - depart_mins
             
             for s in route_stops:
                 if s["id"] not in visited_set and s["id"] in stop_arrivals and ts >= stop_arrivals[s["id"]]:
                     visited_set.add(s["id"])
-                    if is_fwd and _eff(s) > last_visited_order:
-                        last_visited_order = _eff(s)
-                    elif not is_fwd and _eff(s) < last_visited_order:
+                    if _eff(s) > last_visited_order:
                         last_visited_order = _eff(s)
 
             for s in route_stops:

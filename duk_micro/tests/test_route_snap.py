@@ -211,6 +211,69 @@ def test_empty_route_falls_back():
     print("  empty_route OK (falls back to OSRM path)")
 
 
+def test_stationary_drift_is_held():
+    """Bus stopped (speed < 2.5 km/h) with ±8 m drift: s must not creep."""
+    idx = build_route_index(make_hairpin_route())
+    base_lat, base_lon = 8.5241, 76.9366
+    state = {}
+    # Arrive at 200 m moving, then sit still with drift.
+    for d in range(0, 210, 10):
+        lat, lon = _offset(base_lat, base_lon, d, 0.0)
+        _, _, _, state = apply_route_snap_stateless(lat, lon, 30.0, state, idx)
+    drift = [(6, 2), (-5, -3), (8, 1), (-7, 4), (3, -6), (7, 0)]
+    # First stopped fixes may finish the EMA catch-up from the approach (one step).
+    for dn, de in drift[:3]:
+        lat, lon = _offset(base_lat, base_lon, 200 + dn, de)
+        _, _, _, state = apply_route_snap_stateless(lat, lon, 0.5, state, idx)
+    s_stop = state["s"]
+    outs = set()
+    for dn, de in drift * 3:
+        lat, lon = _offset(base_lat, base_lon, 200 + dn, de)
+        o_lat, o_lon, _, state = apply_route_snap_stateless(lat, lon, 0.5, state, idx)
+        outs.add((round(o_lat, 7), round(o_lon, 7)))
+    assert abs(state["s"] - s_stop) < 1e-6, f"s crept {state['s'] - s_stop:.1f} m while stopped"
+    assert len(outs) == 1, f"marker moved while stopped ({len(outs)} positions)"
+    print(f"  stationary_drift OK (held at s={s_stop:.0f} m, 1 position)")
+
+
+def test_first_fix_acquires_by_heading():
+    """
+    Fixes on the RETURN arm (heading south) must end up on the return arm, not
+    the outbound arm 25 m away (and never freeze there).
+    """
+    idx = build_route_index(make_hairpin_route())
+    base_lat, base_lon = 8.5241, 76.9366
+    state = {}
+    # Fixes sit 12 m east of outbound = 13 m west of return; only heading decides.
+    # The very first fix has no heading yet and may lock onto the outbound arm;
+    # within a couple of fixes the wrong-direction check must move it across.
+    for d in (300, 280, 260, 240, 220):
+        lat, lon = _offset(base_lat, base_lon, d, 12.0)
+        _, _, _, state = apply_route_snap_stateless(lat, lon, 30.0, state, idx)
+    # Return arm starts after ~525 m of route.
+    assert state["s"] > 520.0, f"acquired on the outbound arm (s={state['s']:.0f})"
+    print(f"  heading_acquire OK (s={state['s']:.0f} m on return arm)")
+
+
+def test_stop_progress_and_filter_ahead():
+    from duk_common.route_progress import stop_progress, filter_ahead
+    idx = build_route_index(make_hairpin_route())
+    base_lat, base_lon = 8.5241, 76.9366
+    stops = []
+    # Two stops on outbound, two on the return arm right beside them.
+    for i, (dn, de) in enumerate([(100, 0), (400, 0), (400, 25), (100, 25)]):
+        lat, lon = _offset(base_lat, base_lon, dn, de)
+        stops.append({"id": i + 1, "lat": lat, "lon": lon})
+    ss = stop_progress(idx, stops)
+    order = [ss[i] for i in (1, 2, 3, 4)]
+    assert order == sorted(order), f"stop s not in travel order: {order}"
+    assert ss[3] > 525.0, "return-arm stop placed on the outbound arm"
+    # Bus on the return arm past stop 3: only stop 4 is ahead.
+    ahead = filter_ahead(stops, ss, bus_s=ss[3] + 100.0)
+    assert [s["id"] for s in ahead] == [4], f"ahead={[s['id'] for s in ahead]}"
+    print(f"  stop_progress OK (s={[round(v) for v in order]}, ahead=[4])")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} route_snap tests...\n")
