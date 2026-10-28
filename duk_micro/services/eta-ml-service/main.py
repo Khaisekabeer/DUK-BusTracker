@@ -220,7 +220,7 @@ async def predict_eta(
             req.day_of_week,
             1 if req.direction == "reverse" else 0,
             req.elapsed_minutes,
-            req.speed_kmh or 25.0,
+            req.speed_kmh,  # real 0 when stopped, as in training (was `or 25.0`)
             naive_osrm_eta_mins,
         ]], dtype=np.float32)
         try:

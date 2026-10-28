@@ -1162,7 +1162,7 @@ async def get_eta(stop_id: int = Query(...), db: AsyncSession = Depends(get_db),
         raise HTTPException(status_code=404, detail="Stop not found")
 
     speeds = [log.speed for log in recent_logs if log.speed is not None]
-    speed_avg = sum(speeds) / len(speeds) if speeds else 20.0
+    speed_avg = sum(speeds) / len(speeds) if speeds else 25.0  # trainer default for a missing speed
 
     now = datetime.now(timezone.utc)
     now_ist = to_ist(now)
@@ -1238,7 +1238,7 @@ async def get_all_etas(db: AsyncSession = Depends(get_db), _user: str = Depends(
 
     latest = recent_logs[0]
     speeds = [log.speed for log in recent_logs if log.speed is not None]
-    speed_avg = sum(speeds) / len(speeds) if speeds else 20.0
+    speed_avg = sum(speeds) / len(speeds) if speeds else 25.0  # trainer default for a missing speed
 
     now = datetime.now(timezone.utc)
     now_ist = to_ist(now)

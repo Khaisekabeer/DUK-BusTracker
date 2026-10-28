@@ -221,7 +221,10 @@ async def run_training():
                     "lat": l.lat,
                     "lon": l.lon,
                     "ts": t,
-                    "speed": l.speed or 25.0
+                    # Keep a real 0 (stopped). `or 25.0` turned every stopped
+                    # point into 25 km/h, so the model never saw a stopped bus
+                    # while live requests send ~0 at stops.
+                    "speed": l.speed if l.speed is not None else 25.0
                 })
         except Exception:
             await db.rollback()
@@ -305,7 +308,11 @@ async def run_training():
             continue
 
         # Determine origin departure time for elapsed_minutes
-        origin_stop = min(route_stops, key=_eff)
+        # Origin = first stop that has a scheduled time for this direction —
+        # the same rule the live ETA uses (_minutes_since_departure).
+        time_key = "morning_time" if direction == "forward" else "evening_time"
+        timed = [s for s in route_stops if s.get(time_key)] or route_stops
+        origin_stop = min(timed, key=_eff)
             
         sched_time_str = origin_stop.get("morning_time") if direction == "forward" else origin_stop.get("evening_time")
         depart_mins = parse_time_to_minutes(sched_time_str)
