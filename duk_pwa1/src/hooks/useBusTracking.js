@@ -270,7 +270,10 @@ export default function useBusTracking() {
             dispatch({
               type: 'BATCH_UPDATE',
               payload: {
-                busPosition: { lat: msg.lat, lon: msg.lon, speed_kmh: msg.speed_kmh, server_time: msg.server_time, is_live: true },
+                busPosition: {
+                  lat: msg.lat, lon: msg.lon, speed_kmh: msg.speed_kmh, server_time: msg.server_time, is_live: true,
+                  route_s: msg.off_route ? null : (msg.route_s ?? null),  // live road progress for the timeline
+                },
                 isLive: true
               }
             });

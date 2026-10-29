@@ -176,6 +176,10 @@ export default function RouteView() {
     return idx;
   }, [activeBusCoord, stopsToShow, visitedStops]);
 
+  // Route progress from the backend: live from the WebSocket, else trip_state.
+  const busRouteS = busPosition?.route_s ?? tripState?.route_s ?? null;
+  const stopRouteS = tripState?.stop_s && Object.keys(tripState.stop_s).length ? tripState.stop_s : null;
+
   // Highest "next stop" index reached this trip. Progress along a route only
   // moves forward, so a GPS wobble near an earlier stop can't pull it back.
   const maxNextIdxRef = useRef({ tripId: null, idx: -1 });
@@ -190,6 +194,18 @@ export default function RouteView() {
     if (closestStopIdx !== -1 && closestStopIdx > idx) {
       idx = closestStopIdx;
     }
+    // Road progress (metres along the route) is the most reliable signal: the
+    // next stop is the first one still ahead of the bus. Out-and-back roads
+    // make "nearest stop" ambiguous; progress is not.
+    if (busRouteS != null && stopRouteS) {
+      let pIdx = -1;
+      for (let i = 0; i < stopsToShow.length; i++) {
+        const ss = stopRouteS[String(stopsToShow[i].id)];
+        if (ss != null && ss > busRouteS + 40) { pIdx = i; break; }  // 40 m: "at the stop" counts as reached
+        if (ss != null) pIdx = i + 1;
+      }
+      if (pIdx > idx) idx = pIdx;
+    }
     const tid = tripState?.trip_id ?? null;
     const mem = maxNextIdxRef.current;
     if (mem.tripId !== tid) { mem.tripId = tid; mem.idx = -1; }
@@ -198,7 +214,7 @@ export default function RouteView() {
       mem.idx = idx;
     }
     return Math.min(idx, stopsToShow.length);
-  }, [stopsToShow, visitedStops, closestStopIdx, tripState?.trip_id, isActive]);
+  }, [stopsToShow, visitedStops, closestStopIdx, tripState?.trip_id, isActive, busRouteS, stopRouteS]);
 
   const visitedCount = Math.max(Object.keys(visitedStops).length, currentNextIdx);
   const nextStop = currentNextIdx >= 0 && currentNextIdx < stopsToShow.length ? stopsToShow[currentNextIdx] : null;
@@ -214,7 +230,14 @@ export default function RouteView() {
 
   const ROW_HEIGHT = 54;
   let stopProgress = 0;
-  if (isActive && activeBusCoord && currentNextIdx > 0) {
+  const fromS = currentNextIdx > 0 && stopRouteS ? stopRouteS[String(stopsToShow[currentNextIdx - 1]?.id)] : null;
+  const toS = stopRouteS ? stopRouteS[String(stopsToShow[currentNextIdx]?.id)] : null;
+  if (isActive && busRouteS != null && fromS != null && toS != null && toS > fromS) {
+    // Road distance covered between the two stops — follows curves and the
+    // out-and-back sections, and only grows because route_s only grows.
+    stopProgress = Math.min(1, Math.max(0, (busRouteS - fromS) / (toS - fromS)));
+  } else if (isActive && activeBusCoord && currentNextIdx > 0) {
+    // Fallback (no route progress, e.g. unscheduled): straight-line ratio.
     const fromStop = stopsToShow[currentNextIdx - 1];
     const toStop = stopsToShow[currentNextIdx];
     if (Number.isFinite(Number(fromStop?.lat)) && Number.isFinite(Number(fromStop?.lon)) && Number.isFinite(Number(toStop?.lat)) && Number.isFinite(Number(toStop?.lon))) {
@@ -549,8 +572,8 @@ export default function RouteView() {
                         <div className="ios-track-col">
                           <div className={`ios-track-dot ${isCurrent ? 'ios-track-dot-current' : ''} ${isVisited ? 'ios-track-dot-visited' : ''}`} />
                           {!isLast && (
-                            <div className={`ios-track-line ${stopsToShow[idx + 1]?.name in visitedStops ? 'ios-track-line-visited' : ''}`}>
-                              {isActive && anchorIdx === idx && stopProgress > 0 && !(stopsToShow[idx + 1]?.name in visitedStops) && (
+                            <div className={`ios-track-line ${(stopsToShow[idx + 1]?.name in visitedStops || idx + 1 < currentNextIdx) ? 'ios-track-line-visited' : ''}`}>
+                              {isActive && anchorIdx === idx && stopProgress > 0 && !(stopsToShow[idx + 1]?.name in visitedStops || idx + 1 < currentNextIdx) && (
                                 <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: `${stopProgress * 100}%`, background: 'var(--timeline-track, #059669)' }} />
                               )}
                             </div>

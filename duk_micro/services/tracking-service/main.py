@@ -776,9 +776,22 @@ async def trip_state(db: AsyncSession = Depends(get_db), _user: str = Depends(re
             if not is_gps_alive:
                 late_val = max(late_val, auto_late)
                 
+            # Road distance along the planned route for the bus and each stop, so
+            # the timeline can fill the line between stops by real progress
+            # (forward-only) instead of a straight-line ratio.
+            route_s, stop_s = None, {}
+            try:
+                redis = await get_redis()
+                route_s = await _bus_progress(redis, active)
+                if route_s is not None:
+                    stop_s = await _stop_positions(redis, active.direction, all_stops, active.route_id)
+            except Exception as e:
+                logger.debug("[TRACKING] trip_state progress skipped: %s", e)
             return {
                 "trip": display_trip, "status": target_status, "trip_id": active.id,
                 "direction": normalize_direction(active.direction),
+                "route_s": round(route_s, 1) if route_s is not None else None,
+                "stop_s": {str(k): round(v, 1) for k, v in stop_s.items()},
                 "late_by_minutes": late_val, "cancellation_reason": None,
                 "next_trip_time": None, "is_deviated": is_deviated,
                 "last_updated_time": last_updated_time}
