@@ -236,12 +236,18 @@ async def run_training():
     train_rows = []
     test_rows = []
     
-    trip_id_list = list(trips_dict.keys())
-    np.random.seed(42)
-    np.random.shuffle(trip_id_list)
-    split_idx = int(len(trip_id_list) * 0.8)
-    train_trip_ids = set(trip_id_list[:split_idx])
-    test_trip_ids = set(trip_id_list[split_idx:])
+    # 80/20 split per direction, over trips that actually have GPS. Splitting
+    # all trip ids (most have no GPS) left ~3 usable test trips, and by chance
+    # none from the morning, so the morning model was never evaluated.
+    rng = np.random.RandomState(42)
+    train_trip_ids, test_trip_ids = set(), set()
+    for want_rev in (False, True):
+        ids = sorted(t for t in gps_by_trip if t in trips_dict and
+                     ((trips_dict[t].get("direction") or "").lower().strip() in ("reverse", "evening", "e")) == want_rev)
+        rng.shuffle(ids)
+        cut = max(1, int(round(len(ids) * 0.8))) if len(ids) > 1 else len(ids)
+        train_trip_ids.update(ids[:cut])
+        test_trip_ids.update(ids[cut:])
     
     for trip_id, pts in gps_by_trip.items():
         if trip_id not in trips_dict:
