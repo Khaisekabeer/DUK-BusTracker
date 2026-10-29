@@ -198,6 +198,7 @@ async def run_training():
                     "route_id": t.route_id,
                     "direction": t.direction,
                     "started_at": t.started_at,
+                    "date": t.date,
                     "ended_at": t.ended_at
                 } for t in trips_raw
             }
@@ -256,6 +257,12 @@ async def run_training():
         if not route_stops:
             continue
             
+        # Only the trip's own day: old rows were tagged to a trip that stayed
+        # "running" for days (one trip held 18–22 Sep points), which passed
+        # the coverage check and trained on a nonsense timeline.
+        trip_date = trip_info.get("date")
+        if trip_date is not None:
+            pts = [p for p in pts if p["ts"].astimezone(_IST).date() == trip_date]
         pts = sorted(pts, key=lambda x: x["ts"])
         if len(pts) < 10:
             continue
