@@ -64,7 +64,7 @@ ssh -t $SERVER "cd $SERVER_PATH && \
   echo 'Syncing live code into app_src...' && \
   mkdir -p app_src/logs && \
   rsync -a --delete \
-    --exclude '.env' --exclude '.env.*' --exclude '*firebase*' --exclude '*creds*' \
+    --exclude '.env' --exclude '.env.*' --exclude '*creds*.json' \
     --exclude 'osrm-data/' --exclude 'models/' --exclude 'logs/' \
     --exclude 'venv/' --exclude '.venv/' --exclude '__pycache__/' --exclude '.git/' \
     --exclude 'tests/' --exclude 'docs/' \
