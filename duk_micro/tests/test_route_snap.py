@@ -274,6 +274,25 @@ def test_stop_progress_and_filter_ahead():
     print(f"  stop_progress OK (s={[round(v) for v in order]}, ahead=[4])")
 
 
+def test_uturn_back_to_skipped_stop():
+    """Bus drives past a stop, turns round and comes back to it, then carries
+    on. The marker must follow the bus back (not freeze, not stair-step) and
+    pick up again when it drives forward."""
+    base_lat, base_lon = 8.5241, 76.9366
+    idx = build_route_index([[_offset(base_lat, base_lon, d, 0.0)[1], _offset(base_lat, base_lon, d, 0.0)[0]]
+                             for d in range(0, 1200, 20)])
+    state, err = {}, []
+    path = list(range(0, 620, 20)) + list(range(600, 280, -20)) + list(range(300, 700, 20))
+    for d in path:
+        lat, lon = _offset(base_lat, base_lon, d, 3.0)
+        o_lat, _, off, state = apply_route_snap_stateless(lat, lon, 25.0, state, idx)
+        assert not off
+        err.append(abs((o_lat - base_lat) * 111_320.0 - d))
+    back = max(err[33:47])
+    assert back < 25, f"marker lagged {back:.0f} m while the bus came back"
+    assert max(err[50:]) < 25, "marker did not resume forward"
+    print(f"  uturn OK (max error coming back {back:.0f} m)")
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} route_snap tests...\n")

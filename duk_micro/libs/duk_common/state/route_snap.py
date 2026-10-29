@@ -255,7 +255,11 @@ def apply_route_snap_stateless(
                 g = snap_to_route(f_lat, f_lon, index, None, max_back_m, max_fwd_m, heading)
                 if g is not None and g[3] <= corridor_m and \
                         _angle_diff(heading, _bearing_at_s(index, g[2]) or heading) <= 90.0:
-                    new_state.update({"s": g[2], "off_route_hits": 0, "wrong_dir_hits": 0})
+                    # Keep the count at the threshold: while the bus keeps driving
+                    # this way (U-turn back to a stop) every fix follows at once
+                    # instead of hold-one-then-jump. It resets when the heading
+                    # agrees with the route again.
+                    new_state.update({"s": g[2], "off_route_hits": 0, "wrong_dir_hits": 2})
                     new_state.pop("reacq_s", None)
                     pt = _point_at_s(index, g[2])
                     out_lat, out_lon = pt if pt is not None else (g[0], g[1])
