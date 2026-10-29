@@ -233,21 +233,7 @@ async def run_training():
 
     logger.info("[ML] Loaded %d trips and %d GPS points. Extracting features...", len(trips_dict), len(logs))
     
-    train_rows = []
-    test_rows = []
-    
-    # 80/20 split per direction, over trips that actually have GPS. Splitting
-    # all trip ids (most have no GPS) left ~3 usable test trips, and by chance
-    # none from the morning, so the morning model was never evaluated.
-    rng = np.random.RandomState(42)
-    train_trip_ids, test_trip_ids = set(), set()
-    for want_rev in (False, True):
-        ids = sorted(t for t in gps_by_trip if t in trips_dict and
-                     ((trips_dict[t].get("direction") or "").lower().strip() in ("reverse", "evening", "e")) == want_rev)
-        rng.shuffle(ids)
-        cut = max(1, int(round(len(ids) * 0.8))) if len(ids) > 1 else len(ids)
-        train_trip_ids.update(ids[:cut])
-        test_trip_ids.update(ids[cut:])
+    rows_by_trip: dict = {}
     
     for trip_id, pts in gps_by_trip.items():
         if trip_id not in trips_dict:
@@ -380,10 +366,19 @@ async def run_training():
                     recency_w,             # sample weight (last column; not a feature/Y)
                 ]
                 
-                if trip_id in train_trip_ids:
-                    train_rows.append(row)
-                else:
-                    test_rows.append(row)
+                rows_by_trip.setdefault(trip_id, []).append(row)
+
+    # 80/20 split by trip, per direction, over trips that produced samples.
+    # Splitting before the partial-trip filter (or over trip ids without GPS)
+    # could hold back only unusable trips, leaving a direction untested.
+    rng = np.random.RandomState(42)
+    train_rows, test_rows = [], []
+    for flag in (0, 1):
+        ids = sorted(t for t, r in rows_by_trip.items() if r[0][4] == flag)
+        rng.shuffle(ids)
+        cut = max(1, int(round(len(ids) * 0.8))) if len(ids) > 1 else len(ids)
+        for i, t in enumerate(ids):
+            (train_rows if i < cut else test_rows).extend(rows_by_trip[t])
 
     # Drop exact-duplicate samples so repeated identical observations don't bias
     # the fit or leak between the train/test split. Key on features+target only
