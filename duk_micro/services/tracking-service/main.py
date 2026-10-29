@@ -297,7 +297,10 @@ async def _publish_public_meta_loop():
             logger.exception("[PUBLIC_META] publish loop error")
         await asyncio.sleep(5)
 
-ETA_ML_URL = os.environ.get("ETA_ML_URL", "http://eta-ml-service:8003")
+# eta-ml-service runs inside the same process as tracking (mega_gateway routes
+# /api/v1/ml). The old default, http://eta-ml-service:8003, is a host that does
+# not exist in this deployment, so every ML call failed and ETAs were OSRM-only.
+ETA_ML_URL = os.environ.get("ETA_ML_URL", "http://127.0.0.1:8000")
 
 from libs.duk_common.constants import normalize_direction
 

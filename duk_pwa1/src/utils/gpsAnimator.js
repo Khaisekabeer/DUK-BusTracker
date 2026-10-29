@@ -17,6 +17,8 @@ class GPSAnimator {
     this.MAX_BACKLOG        = options.maxBacklog       ?? 2;    // more queued legs than this = catch-up: skip to newest
     this.STALE_GAP_MS       = options.staleGapMs       ?? 30000; // a gap this long (sleep / reconnect) = teleport
     this.TELEPORT_M         = options.teleportM        ?? 1500;  // so far away that animating would be a "rush"
+    this.DETOUR_FACTOR      = options.detourFactor     ?? 2;     // road path longer than this × straight line ...
+    this.DETOUR_SLACK_M     = options.detourSlackM     ?? 80;    // ... plus this = a routing detour, not the bus's path
     this.MAX_ANIM_DURATION  = options.maxAnimDuration  ?? 8000; // cap animation length (ms) 
     this.MIN_ANIM_DURATION  = options.minAnimDuration  ?? 800;  // floor, avoid instant snaps
     this.FETCH_ROAD_SEGMENT = options.fetchRoadSegment ?? true; // follow real road shape
@@ -153,6 +155,14 @@ class GPSAnimator {
     // point, which is not always where the marker is).
     path = this._anchorPath(path, this.currentPos, next);
 
+    // OSRM can't U-turn or drive a one-way backwards, so between two close
+    // fixes it sometimes returns a loop around the block. Driving the marker
+    // round that loop is the "goes off and jumps back" effect (worst on
+    // unscheduled trips, which have no planned route). Hop straight instead.
+    if (this._pathLength(path) > this.DETOUR_FACTOR * distM + this.DETOUR_SLACK_M) {
+      path = [[this.currentPos.lon, this.currentPos.lat], [next.lon, next.lat]];
+    }
+
     // Precompute segment data for O(log n) frame interpolation
     this._segData = this._buildSegData(path);
     this._animateAlongPath(path, duration, next);
@@ -273,6 +283,14 @@ class GPSAnimator {
     if (dFrom > 150 || dTo > 150) return straight;
     const mid = path.slice(iFrom, iTo + 1);
     return [[from.lon, from.lat], ...mid, [to.lon, to.lat]];
+  }
+
+  _pathLength(path) {
+    let m = 0;
+    for (let i = 1; i < path.length; i++) {
+      m += this._haversineM(path[i - 1][1], path[i - 1][0], path[i][1], path[i][0]);
+    }
+    return m;
   }
 
   _haversineM(lat1, lon1, lat2, lon2) {

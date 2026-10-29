@@ -21,7 +21,8 @@ echo ""
 
 echo "[1/4] Syncing duk_micro Backend to Server..."
 # Sync the microservices source code, ignoring Python cache and venv
-rsync -avz --exclude="venv" --exclude="__pycache__" --exclude=".git" ./duk_micro $SERVER:$SERVER_PATH/
+# models/ is trained ON the server (ml-training-job) — never overwrite it with the local copy.
+rsync -avz --exclude="venv" --exclude="__pycache__" --exclude=".git" --exclude="models/" ./duk_micro $SERVER:$SERVER_PATH/
 # Mirror migrations exactly. A stale file left on the server (e.g. an old copy of
 # a revision under another filename) makes Alembic see duplicate revisions and
 # multiple heads. The pre-sync copy is kept in $SERVER_PATH/alembic_versions_backup

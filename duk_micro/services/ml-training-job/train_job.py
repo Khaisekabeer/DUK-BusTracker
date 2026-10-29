@@ -65,6 +65,7 @@ MIN_TRIPS = int(os.environ.get("MIN_TRIPS", "5"))
 MIN_GPS_ROWS = int(os.environ.get("MIN_GPS_ROWS", "100"))
 # Model MAE must be below baseline MAE × this factor to be saved (0.9 = ≥10% better).
 ML_MIN_GAIN = float(os.environ.get("ML_MIN_GAIN", "0.9"))
+ML_MIN_DIR_ROWS = int(os.environ.get("ML_MIN_DIR_ROWS", "30"))  # per-direction check needs this many test rows
 
 engine = create_async_engine(DATABASE_URL)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -278,7 +279,11 @@ async def run_training():
         pts = _dedup_points(pts, GPS_DEDUP_M)
         if len(pts) < 10:
             continue
-        if not _trip_is_complete(pts, route_stops, _eff, TRIP_COVERAGE_M):
+        # Only stops this direction serves: a morning-only stop is not where an
+        # evening trip starts or ends, and using it rejected/accepted wrongly.
+        tk = "morning_time" if is_fwd else "evening_time"
+        dir_stops = [s for s in route_stops if s.get(tk)] or route_stops
+        if not _trip_is_complete(pts, dir_stops, _eff, TRIP_COVERAGE_M):
             logger.info("[ML] Trip %s rejected: GPS does not cover full route (skipped/partial).", trip_id)
             continue
 
@@ -439,6 +444,21 @@ async def run_training():
         logger.warning("[ML] Model not better than baseline (needs MAE < %.2f) — NOT saved.",
                        baseline_mae * ML_MIN_GAIN)
         return
+    # One model serves both directions (direction is feature 4), so the overall
+    # number can hide a direction it does badly on. Check each direction that
+    # has enough test rows to judge; a direction with too few is reported only.
+    for flag, name in ((0, "morning"), (1, "evening")):
+        mask = X_test[:, 4] == flag
+        n = int(mask.sum())
+        if n < ML_MIN_DIR_ROWS:
+            logger.info("[ML]   %s: %d test rows — too few to judge on its own", name, n)
+            continue
+        d_mae = mean_absolute_error(y_test[mask], predictions[mask])
+        d_base = mean_absolute_error(y_test[mask], X_test[mask, 7])
+        logger.info("[ML]   %s: MAE %.2f min vs baseline %.2f (%d rows)", name, d_mae, d_base, n)
+        if d_mae >= d_base * ML_MIN_GAIN:
+            logger.warning("[ML] Model worse than baseline for %s trips — NOT saved.", name)
+            return
 
     # Save ONNX model directly to disk first
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)

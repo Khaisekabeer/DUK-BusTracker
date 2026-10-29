@@ -173,6 +173,9 @@ _planned_route_versions: dict[str, str] = {}
 
 # How far the bus must deviate from the planned route before we call OSRM.
 SNAP_OSRM_THRESHOLD_M = 50.0
+# Off-route (unscheduled) OSRM snaps that move a fix farther than this are
+# treated as a wrong-road match and ignored.
+OFF_ROUTE_MAX_SNAP_M = 20.0
 
 # Linear-reference index (cumulative distance along the planned route), built
 # once per direction from the planned polyline and rebuilt when the route edits.
@@ -232,6 +235,10 @@ async def _route_snap_point(
         snap_state = await snap_mgr.load()
         bearing = float(snap_state["bearing"]) if snap_state.get("bearing") is not None else None
         s_lat, s_lon = await snap_to_road(f_lat, f_lon, bearing=bearing)
+        if _haversine_m(f_lat, f_lon, s_lat, s_lon) > OFF_ROUTE_MAX_SNAP_M:
+            # Nearest-road snap jumped to another road (campus / service roads
+            # beside the highway). Farther than GPS error = wrong road: keep the fix.
+            s_lat, s_lon = f_lat, f_lon
         await snap_mgr.save(apply_snap_stateless(f_lat, f_lon, s_lat, s_lon, snap_state))
         return s_lat, s_lon, route_s, True, bearing
 
