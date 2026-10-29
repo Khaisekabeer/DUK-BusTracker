@@ -74,6 +74,7 @@ ssh -t $SERVER "cd $SERVER_PATH && \
   if [ \"\$DEPS_HASH\" != \"\$(cat .deps_hash 2>/dev/null)\" ]; then \
     echo 'Dependencies changed — rebuilding image...' && \
     sudo docker-compose build && \
+    sudo docker-compose rm -fs core-api background-workers && \
     sudo docker-compose up -d && \
     echo \"\$DEPS_HASH\" > .deps_hash; \
   else \
